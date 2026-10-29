@@ -1,0 +1,5137 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ハイブリッド・タイピングRPG</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  #gameCanvas {
+    display: block;
+    image-rendering: pixelated;
+    border: 2px solid #444;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+// ===== キャンバス =====
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = 640, H = 480;
+canvas.width = W;
+canvas.height = H;
+
+let mode = 'title'; // 'title'|'howtoplay'|'field'|'flash'|'battle'|'victory'|'gameover'|'gameclear'
+
+// ===== リトライフェードイン演出 =====
+// ゲームオーバー後のセーブデータ復帰時に暗転→フィールドへじわっと戻す
+const retryFade = {
+  active: false,
+  timer:  0,
+  duration: 90, // 1.5秒（60fps）
+};
+const BOSS_EVENT = {
+  tx: 10, ty: 10,         // マップ上のボス固定座標（左端火山エリア内）
+  isDefeated: false,      // 撃破済みフラグ（ゲームクリア条件）
+  isNear: false,          // プレイヤーが接近中フラグ（UI表示用）
+  triggerRadius: 0.8,     // エンカウントトリガー半径（タイル）
+};
+
+// ゲームクリア画面用タイマー
+let gameclearTimer = 0;
+
+// ===== アイソメトリック定数 =====
+const TW = 40, TH = 40;  // トップダウン：正方形タイル
+const MAP_W = 80, MAP_H = 80;
+
+// ===== 座標変換：トップダウン（真上視点） =====
+// タイルを正方形グリッドで並べる
+// camX/camY はワールド空間でのカメラ左上基点（ピクセル単位）
+function isoToScreen(tx, ty, camX, camY) {
+  return {
+    sx: tx * TW - camX,
+    sy: ty * TH - camY,
+  };
+}
+
+// ===== バイオーム定義 =====
+// 0=平原 1=森 2=砂漠 3=雪原 4=火山 5=湿地 6=海岸
+const BIOME = { PLAIN:0, FOREST:1, DESERT:2, SNOW:3, VOLCANO:4, SWAMP:5, COAST:6 };
+
+const BIOME_INFO = [
+  { name:'平原',  encRate:0.8 },
+  { name:'森',    encRate:1.2 },
+  { name:'砂漠',  encRate:1.0 },
+  { name:'雪原',  encRate:1.0 },
+  { name:'火山',  encRate:1.4 },
+  { name:'湿地',  encRate:1.1 },
+  { name:'海岸',  encRate:0.7 },
+];
+
+// ===== タイル定義 =====
+// tileId → [biome, variant]
+// 平原:  0=草,1=濃草  森: 10=林床,11=苔  砂漠: 20=砂,21=岩砂
+// 雪原:  30=雪,31=氷  火山: 40=溶岩地,41=黒岩  湿地: 50=泥,51=沼水
+// 海岸:  60=砂浜,61=浅瀬  水(共通): 70
+const TILE_DEF = {
+   0: { top:'#5AB86C', lft:'#3A7A45', rgt:'#4A9A58' },  // 平原・草
+   1: { top:'#3A8A48', lft:'#1E5A2A', rgt:'#2E7038' },  // 平原・濃草
+  10: { top:'#4A7A35', lft:'#2E5020', rgt:'#3A6028' },  // 森・林床
+  11: { top:'#3A6A2A', lft:'#204018', rgt:'#2A5020' },  // 森・苔
+  20: { top:'#D4B96A', lft:'#9A8040', rgt:'#B89A50' },  // 砂漠・砂
+  21: { top:'#B89850', lft:'#806830', rgt:'#9A7840' },  // 砂漠・岩砂
+  30: { top:'#E8EEF8', lft:'#A0AABF', rgt:'#C0C8D8' },  // 雪原・雪
+  31: { top:'#C8D8F0', lft:'#88A0C0', rgt:'#A0B8D8' },  // 雪原・氷
+  40: { top:'#3A2015', lft:'#1A1008', rgt:'#2A1810' },  // 火山・黒岩
+  41: { top:'#4A2810', lft:'#281408', rgt:'#381C0C' },  // 火山・焦岩
+  50: { top:'#4A5A30', lft:'#2A3818', rgt:'#384828' },  // 湿地・泥
+  51: { top:'#2A5040', lft:'#183028', rgt:'#204038' },  // 湿地・沼
+  60: { top:'#D8C080', lft:'#988048', rgt:'#B09060' },  // 海岸・砂浜
+  61: { top:'#60A8C0', lft:'#388090', rgt:'#4890A8' },  // 海岸・浅瀬
+  70: null, // 水(特殊描画)
+  71: null, // 溶岩(特殊描画)
+  80: { top:'#9A9080', lft:'#6A6058', rgt:'#807870' },  // 石畳（村広場）
+};
+
+// ===== マップデータ =====
+const mapTiles   = []; // [y][x] = tileId
+const mapBiome   = []; // [y][x] = biomeId
+const mapObjects = []; // {tx,ty,type,biome}
+const mapTowns   = []; // {tx,ty,type:'village'|'inn', name, biome} 村・宿リスト
+
+function generateMap() {
+  // シンプルなノイズでバイオームゾーンを分割
+  let seed = 99887;
+  function rng() {
+    seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+    return (seed >>> 0) / 0xffffffff;
+  }
+
+  // ===== ノイズグリッド =====
+  // CELL を大きくすることでノイズの波長を伸ばし、
+  // バイオームが大きな塊として現れるようにする
+  const CELL = 40; // 旧: 10 → 4倍の波長（1塊がマップの半分規模）
+  const gw = Math.ceil(MAP_W / CELL) + 2;
+  const gh = Math.ceil(MAP_H / CELL) + 2;
+
+  // グリッド生成ヘルパー
+  function makeGrid() {
+    const g = [];
+    for (let gy = 0; gy < gh; gy++) {
+      g[gy] = [];
+      for (let gx = 0; gx < gw; gx++) g[gy][gx] = rng();
+    }
+    return g;
+  }
+
+  // Smoothstep バイリニア補間
+  function sampleGrid(g, x, y) {
+    const gx  = Math.floor(x / CELL), gy  = Math.floor(y / CELL);
+    const fx  = (x % CELL) / CELL,   fy  = (y % CELL) / CELL;
+    const fx2 = fx * fx * (3 - 2 * fx);
+    const fy2 = fy * fy * (3 - 2 * fy);
+    const a = g[gy][gx],     b = g[gy][gx + 1];
+    const c = g[gy + 1][gx], d = g[gy + 1][gx + 1];
+    return a*(1-fx2)*(1-fy2) + b*fx2*(1-fy2) + c*(1-fx2)*fy2 + d*fx2*fy2;
+  }
+
+  // ノイズ2種（高度・温度）をそれぞれ別のグリッドで生成
+  const gridH = makeGrid(); // 高度ノイズ（陸・海・高地を決める）
+  const gridT = makeGrid(); // 温度ノイズ（暑さ・寒さを決める）
+
+  // ===== タイル・バイオーム生成 =====
+  for (let y = 0; y < MAP_H; y++) {
+    mapTiles[y] = [];
+    mapBiome[y] = [];
+
+    // 緯度バイアス：
+    //   北端(y=0)  → latBias=-0.425  温度を下げる（雪原・火山寄り）
+    //   中央(y=40) → latBias= 0      バイアスなし
+    //   南端(y=79) → latBias=+0.425  温度を上げる（砂漠・海岸寄り）
+    const latBias = ((y / (MAP_H - 1)) - 0.5) * 0.85;
+
+    for (let x = 0; x < MAP_W; x++) {
+      const r = rng();
+      // 高度・温度ノイズを取得し、緯度バイアスを温度に加算
+      const h = sampleGrid(gridH, x, y);               // 0〜1
+      const t = Math.min(1, Math.max(0,
+                  sampleGrid(gridT, x, y) + latBias));  // 0〜1（クランプ）
+
+      // ===== バイオーム決定 =====
+      //
+      // 【設計方針】
+      // ・湿地を h < 0.42 → h < 0.32 に縮小し、低地でも森・平原が出やすくなるよう調整
+      // ・平原の温度上限を t > 0.65 → t > 0.68 に引き上げ、中温帯を森に割り当てる
+      // ・森の高度上限を h < 0.72 → h < 0.78 に広げ、広大な大森林を実現
+      //
+      // 【砂漠の境界線ぼかし】
+      //  従来の「y > MAP_H*0.80」は水平直線になって不自然だったため、
+      //  高度ノイズ h（0〜1）を境界ラインに加算して凸凹させる。
+      //    desertEdge = MAP_H * 0.78 + h * 8
+      //  hが高い（高地）ほど境界が北寄りにずれ、低地ほど南寄りになる。
+      //  ±8タイル（= h*8）の揺らぎで、ジグザグした有機的な境界が生まれる。
+      //  さらに温度条件も残すことで、境界付近に砂漠・平原が混在したグラデーションを作る。
+      //
+      // 1. 海岸  : h < 0.22  （最優先・水辺）
+      // 2. 雪原  : t < 0.35
+      // 3. 火山  : t < 0.52 && h > 0.42
+      // 4. 砂漠  : y > MAP_H*0.78 + h*8 かつ t > 0.65  （高度ノイズで境界をジグザグ化）
+      // 5. 湿地  : h < 0.32  （旧: h<0.42 → 縮小。低地のみに限定）
+      // 6. 平原  : t > 0.68  （旧: t>0.65 → 中温帯を森に解放）
+      // 7. 森    : h < 0.78  （旧: h<0.72 → 大幅拡大）
+      // 8. default: 平原
+      let biome;
+      if      (h < 0.22)                                     biome = BIOME.COAST;
+      else if (t < 0.35)                                     biome = BIOME.SNOW;
+      else if (t < 0.52 && h > 0.42)                        biome = BIOME.VOLCANO;
+      else if (y > MAP_H * 0.78 + h * 8 && t > 0.65)       biome = BIOME.DESERT;
+      else if (h < 0.32)                                     biome = BIOME.SWAMP;
+      else if (t > 0.68)                                     biome = BIOME.PLAIN;
+      else if (h < 0.78)                                     biome = BIOME.FOREST;
+      else                                                   biome = BIOME.PLAIN;
+
+      // ===== 左端エリア：雪原 → 火山への強制上書き =====
+      // x < MAP_W*0.25（0〜19列）：雪原を火山に完全置換
+      // x < MAP_W*0.30（20〜23列）：グラデーションゾーン（右に行くほど置換確率が下がる）
+      // 水タイル・その他バイオームは変更しない
+      if (biome === BIOME.SNOW) {
+        const hardEdge  = MAP_W * 0.25; // 完全置換ライン（x < 20）
+        const blendEdge = MAP_W * 0.30; // グラデーション終端（x < 24）
+        if (x < hardEdge) {
+          biome = BIOME.VOLCANO;
+        } else if (x < blendEdge) {
+          // 境界から右に離れるほど確率が下がる線形ブレンド
+          const prob = 1 - (x - hardEdge) / (blendEdge - hardEdge);
+          if (r < prob) biome = BIOME.VOLCANO;
+        }
+      }
+
+      mapBiome[y][x] = biome;
+
+      // ===== タイルID決定（バイオームに応じて選択） =====
+      let tileId;
+      if      (h < 0.22)                 tileId = 70; // 深海
+      else if (biome === BIOME.COAST)    tileId = h < 0.26 ? 61 : (r < 0.6 ? 60 : 61);
+      else if (biome === BIOME.PLAIN)    tileId = r < 0.65 ? 0 : 1;
+      else if (biome === BIOME.FOREST)   tileId = r < 0.6  ? 10 : 11;
+      else if (biome === BIOME.DESERT)   tileId = r < 0.7  ? 20 : 21;
+      else if (biome === BIOME.SNOW)     tileId = r < 0.65 ? 30 : 31;
+      else if (biome === BIOME.VOLCANO)  tileId = h > 0.82 ? 71 : (r < 0.6 ? 40 : 41);
+      else if (biome === BIOME.SWAMP)    tileId = r < 0.55 ? 50 : 51;
+      else                               tileId = 0;
+
+      mapTiles[y][x] = tileId;
+    }
+  }
+
+  // オブジェクト配置
+  const startX = Math.floor(MAP_W/2), startY = Math.floor(MAP_H/2);
+  for (let y = 1; y < MAP_H-1; y++) {
+    for (let x = 1; x < MAP_W-1; x++) {
+      const tid = mapTiles[y][x];
+      if (tid === 70 || tid === 71) continue;
+      if (Math.abs(x-startX)<4 && Math.abs(y-startY)<4) continue;
+      const r = rng();
+      const biome = mapBiome[y][x];
+      if (biome === BIOME.PLAIN   && r < 0.04) mapObjects.push({tx:x,ty:y,type:'tree'});
+      else if (biome === BIOME.PLAIN && r < 0.06) mapObjects.push({tx:x,ty:y,type:'rock'});
+      else if (biome === BIOME.FOREST && r < 0.12) mapObjects.push({tx:x,ty:y,type:'tree'});
+      else if (biome === BIOME.FOREST && r < 0.14) mapObjects.push({tx:x,ty:y,type:'bigrock'});
+      else if (biome === BIOME.DESERT && r < 0.05) mapObjects.push({tx:x,ty:y,type:'cactus'});
+      else if (biome === BIOME.DESERT && r < 0.08) mapObjects.push({tx:x,ty:y,type:'rock'});
+      else if (biome === BIOME.SNOW   && r < 0.06) mapObjects.push({tx:x,ty:y,type:'snowtree'});
+      else if (biome === BIOME.SNOW   && r < 0.09) mapObjects.push({tx:x,ty:y,type:'icerock'});
+      else if (biome === BIOME.VOLCANO&& r < 0.05) mapObjects.push({tx:x,ty:y,type:'lavarock'});
+      else if (biome === BIOME.SWAMP  && r < 0.07) mapObjects.push({tx:x,ty:y,type:'deadtree'});
+      else if (biome === BIOME.COAST  && r < 0.03) mapObjects.push({tx:x,ty:y,type:'palmtree'});
+    }
+  }
+
+  // ===== 村・宿の配置 =====
+  // バイオームごとに名前リストを持つ
+  const VILLAGE_NAMES = {
+    [BIOME.PLAIN]:   ['グリーンヘイム', 'リーフタウン',  'サニーグレン'],
+    [BIOME.FOREST]:  ['モスウッド',     'エルダーグロブ','フェアリーホロウ'],
+    [BIOME.DESERT]:  ['サンドポスト',   'オアシスエッジ','デューンズレスト'],
+    [BIOME.SNOW]:    ['フロストホルム', 'アイスピーク',  'ウィンターベール'],
+    [BIOME.VOLCANO]: ['アッシュフォード','エンバーキープ','クレーターゲート'],
+    [BIOME.SWAMP]:   ['マードウォーター','ボグトン',     'リードハロウ'],
+    [BIOME.COAST]:   ['タイドハーバー', 'シェルコーブ',  'マリンブレイク'],
+  };
+  const INN_NAMES = {
+    [BIOME.PLAIN]:   ['旅人の宿　ヘイ'],
+    [BIOME.FOREST]:  ['森の隠れ宿'],
+    [BIOME.DESERT]:  ['砂漠のオアシス亭'],
+    [BIOME.SNOW]:    ['雪原の暖炉宿'],
+    [BIOME.VOLCANO]: ['溶岩の宿場'],
+    [BIOME.SWAMP]:   ['沼地の浮き宿'],
+    [BIOME.COAST]:   ['波音の宿　海辺'],
+  };
+
+  // 各バイオームに村2〜3か所、宿1〜2か所を分散配置
+  // 16×16のゾーン分割で各ゾーンに1施設まで
+  const ZONE = 16;
+  const usedZones = new Set();
+
+  function tryPlaceTown(type, nameTable) {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const x = 2 + Math.floor(rng() * (MAP_W - 4));
+      const y = 2 + Math.floor(rng() * (MAP_H - 4));
+      const tid = mapTiles[y]?.[x];
+      if (!tid || tid === 70 || tid === 71) continue;
+      // スタート付近を除外
+      if (Math.abs(x - startX) < 5 && Math.abs(y - startY) < 5) continue;
+      // ゾーン重複チェック（施設同士が近すぎないように）
+      // attempt > 150 のときはゾーン重複を許容（砂漠など狭バイオームでの全滅を防ぐ）
+      const zoneKey = `${Math.floor(x/ZONE)}_${Math.floor(y/ZONE)}`;
+      if (attempt < 150 && usedZones.has(zoneKey)) continue;
+      // 既存オブジェクトと重複しないよう除外
+      const tooClose = mapObjects.some(o => Math.hypot(o.tx-x, o.ty-y) < 2) ||
+                       mapTowns.some(t => Math.hypot(t.tx-x, t.ty-y) < 6);
+      if (tooClose) continue;
+
+      const biome = mapBiome[y][x];
+      const names = nameTable[biome] || nameTable[BIOME.PLAIN];
+      const name  = names[Math.floor(rng() * names.length)];
+      mapTowns.push({ tx:x, ty:y, type, name, biome });
+      usedZones.add(zoneKey);
+
+      // 建物周囲を「石畳」風に上書き（tileId=80）して広場を作る
+      // 安全圏（半径2.8）に視覚的に対応するよう 5×5 に拡張。
+      // 中心1マスは建物タイルなので変えない。水・溶岩タイルも変えない。
+      for (let dy2 = -2; dy2 <= 2; dy2++) {
+        for (let dx2 = -2; dx2 <= 2; dx2++) {
+          const nx2=x+dx2, ny2=y+dy2;
+          if (nx2<0||ny2<0||nx2>=MAP_W||ny2>=MAP_H) continue;
+          if (mapTiles[ny2][nx2]===70||mapTiles[ny2][nx2]===71) continue;
+          if (dx2===0&&dy2===0) continue; // 建物タイル自体は変えない
+          mapTiles[ny2][nx2] = 80; // 石畳
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 村を10か所程度
+  for (let i = 0; i < 10; i++) tryPlaceTown('village', VILLAGE_NAMES);
+  // 宿を8か所程度
+  for (let i = 0; i < 8;  i++) tryPlaceTown('inn',     INN_NAMES);
+
+  // ===== ボス周囲 3×3 を火山タイルに強制塗り替え =====
+  // 座標(BOSS_EVENT.tx, BOSS_EVENT.ty)が確実に火山バイオーム上に存在するよう保証する。
+  // 水タイル(70/71)のみ例外として変更しない。
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const bx = BOSS_EVENT.tx + dx;
+      const by = BOSS_EVENT.ty + dy;
+      if (bx < 0 || by < 0 || bx >= MAP_W || by >= MAP_H) continue;
+      if (mapTiles[by][bx] === 70 || mapTiles[by][bx] === 71) continue;
+      mapBiome[by][bx] = BIOME.VOLCANO;
+      mapTiles[by][bx] = 40; // 火山・黒岩
+    }
+  }
+
+  // ===== ボス周囲 溶岩お堀（半径3〜4タイルの円状溶岩リング） =====
+  // Math.hypot で円形判定し、自然な曲線の堀を作る。
+  // 入口（プレイヤーが入れるよう南東方向）は意図的に空ける。
+  const MOAT_INNER = 2.8; // 内径
+  const MOAT_OUTER = 4.2; // 外径
+  for (let dy = -5; dy <= 5; dy++) {
+    for (let dx = -5; dx <= 5; dx++) {
+      const dist = Math.hypot(dx, dy);
+      if (dist < MOAT_INNER || dist > MOAT_OUTER) continue;
+      // 入口：南東方向（dx>0かつdy>0）の1タイル幅を空ける
+      if (dx >= 2 && dy >= 2 && dx + dy <= 6) continue;
+      const bx = BOSS_EVENT.tx + dx;
+      const by = BOSS_EVENT.ty + dy;
+      if (bx < 0 || by < 0 || bx >= MAP_W || by >= MAP_H) continue;
+      mapTiles[by][bx] = 71; // 溶岩
+      mapBiome[by][bx] = BIOME.VOLCANO;
+    }
+  }
+
+  // ===== ボス周囲の障害物クレンジング（スタック防止） =====
+  // 堀の外径+1タイルまでの範囲（半径5タイル以内）のオブジェクトをすべて除去する。
+  // demon_castle は後で手動追加するので除去しない（存在しない時点で実行するので問題なし）。
+  const CLEAR_RADIUS = 5;
+  for (let i = mapObjects.length - 1; i >= 0; i--) {
+    const o = mapObjects[i];
+    if (Math.hypot(o.tx - BOSS_EVENT.tx, o.ty - BOSS_EVENT.ty) <= CLEAR_RADIUS) {
+      mapObjects.splice(i, 1);
+    }
+  }
+
+  // ===== 魔王城オブジェクトを配置 =====
+  // Zソートに乗るよう mapObjects に登録する。
+  // 描画は drawIsoObject 内の 'demon_castle' ケースで行う。
+  mapObjects.push({ tx: BOSS_EVENT.tx, ty: BOSS_EVENT.ty, type: 'demon_castle' });
+}
+generateMap();
+
+// スタート位置を陸地に補正
+{
+  let sx = Math.floor(MAP_W/2), sy = Math.floor(MAP_H/2);
+  outer: for (let r = 0; r < 20; r++) {
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      const tx = sx+dx, ty = sy+dy;
+      if (tx<0||ty<0||tx>=MAP_W||ty>=MAP_H) continue;
+      const tid = mapTiles[ty][tx];
+      if (tid !== 70 && tid !== 71) { sx = tx; sy = ty; break outer; }
+    }
+  }
+  var START_X = sx, START_Y = sy;
+}
+
+// ===== セーブ通知（フィールド上のフローティングメッセージ） =====
+const saveNotify = {
+  msg:   '',   // 表示するテキスト
+  timer: 0,    // 残りフレーム数（0 で非表示）
+};
+const SAVE_NOTIFY_DURATION = 120; // 2秒（60fps × 2）
+
+// ===== フィールド状態 =====
+const field = {
+  px: 0, py: 0,
+  camX: 0, camY: 0,
+  stepCount: 0,
+  encountSteps: 20,
+  moving: false,
+  walkFrame: 0,
+  facing: 'down',
+};
+field.px = START_X;
+field.py = START_Y;
+
+// ===== 入力 =====
+const keys = {};
+document.addEventListener('keydown', e => {
+  if (!keys[e.key]) { keys[e.key] = true; onKeyDown(e.key); }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  keys[e.key] = false;
+  if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','a','s','d'].some(k=>keys[k])) {
+    field.moving = false; field.walkFrame = 0;
+  }
+});
+
+// ===== タイトル画面状態 =====
+const title = {
+  cursor: 0,        // 0=はじめから, 1=つづきから
+  animTimer: 0,     // 点滅・アニメ用タイマー
+};
+
+// ===== フラッシュ =====
+const flash = { timer:0, duration:60, phase:0 };
+
+// ===== プレイヤー =====
+const player = {
+  hp:50, maxHp:50, mp:20, maxMp:20,
+  lv:1, exp:0, atk:10, def:3,
+  coins: 0,
+  // 装備スロット（null = 未装備）
+  equip: { weapon: null, armor: null },
+  // インベントリ [{itemId, qty}]
+  inventory: [],
+  // 習得済みコマンド（id の配列）
+  learnedAttacks: ['kougeki'],
+  learnedMagics:  [],
+};
+
+// 装備の実効ステータス（基礎値＋装備ボーナス）
+function playerAtk() {
+  const w = player.equip.weapon;
+  return player.atk + (w ? WEAPON_MASTER[w].atkBonus : 0);
+}
+function playerDef() {
+  const a = player.equip.armor;
+  return player.def + (a ? ARMOR_MASTER[a].defBonus : 0);
+}
+
+// ===== アイテム・武器・防具マスターデータ =====
+const WEAPON_MASTER = {
+  // ── 初級 ──
+  'ひのきのぼう':    { name:'ひのきのぼう',    price:30,   atkBonus:2,  desc:'ATK+2',  element:null },
+  'どうのつるぎ':    { name:'どうのつるぎ',    price:120,  atkBonus:6,  desc:'ATK+6 ⚡',element:'shock', elemChance:0.25 },
+  // ── 中級 ──
+  'てつのつるぎ':    { name:'てつのつるぎ',    price:300,  atkBonus:12, desc:'ATK+12', element:null },
+  'まじゅつのつえ':  { name:'まじゅつのつえ',  price:350,  atkBonus:10, desc:'ATK+10', element:null },
+  'くさなぎのつるぎ':{ name:'くさなぎのつるぎ',price:450,  atkBonus:15, desc:'ATK+15', element:null },
+  // ── 上級 ──
+  'はがねのけん':    { name:'はがねのけん',    price:800,  atkBonus:22, desc:'ATK+22', element:null },
+  'こおりのつるぎ':  { name:'こおりのつるぎ',  price:900,  atkBonus:24, desc:'ATK+24 🧊',element:'freeze', elemChance:0.35 },
+  'どくのやいば':    { name:'どくのやいば',    price:1000, atkBonus:20, desc:'ATK+20', element:null },
+  // ── 最強級 ──
+  'ほのおのけん':    { name:'ほのおのけん',    price:1800, atkBonus:35, desc:'ATK+35 🔥',element:'burn',   elemChance:0.50 },
+  'りゅうのつるぎ':  { name:'りゅうのつるぎ',  price:2500, atkBonus:45, desc:'ATK+45 🔥',element:'burn',   elemChance:0.60 },
+};
+const ARMOR_MASTER = {
+  // ── 初級 ──
+  'ぬののふく':     { name:'ぬののふく',     price:25,   defBonus:2,  desc:'DEF+2' },
+  'かわのよろい':   { name:'かわのよろい',   price:100,  defBonus:6,  desc:'DEF+6' },
+  // ── 中級 ──
+  'くさりかたびら': { name:'くさりかたびら', price:250,  defBonus:12, desc:'DEF+12' },
+  'みずのローブ':   { name:'みずのローブ',   price:300,  defBonus:10, desc:'DEF+10' },
+  'もりのよろい':   { name:'もりのよろい',   price:400,  defBonus:14, desc:'DEF+14' },
+  // ── 上級 ──
+  'てつのよろい':   { name:'てつのよろい',   price:600,  defBonus:20, desc:'DEF+20' },
+  'こおりのよろい': { name:'こおりのよろい', price:750,  defBonus:22, desc:'DEF+22' },
+  'まじゅつのローブ':{ name:'まじゅつのローブ',price:900,defBonus:18, desc:'DEF+18' },
+  // ── 最強級 ──
+  'まほうのよろい': { name:'まほうのよろい', price:1500, defBonus:32, desc:'DEF+32' },
+  'りゅうのよろい': { name:'りゅうのよろい', price:2200, defBonus:40, desc:'DEF+40' },
+};
+const ITEM_MASTER = {
+  'やくそう':       { name:'やくそう',       price:30,  type:'heal',  value:50,  desc:'HP+50回復' },
+  'どくけしそう':   { name:'どくけしそう',   price:20,  type:'mpHeal',value:30,  desc:'MP+30回復' },
+  'エリクサー':     { name:'エリクサー',     price:300, type:'full',  value:0,   desc:'HP・MP全回復' },
+  'せいすい':       { name:'せいすい',       price:50,  type:'atkUp', value:5,   desc:'ATK+5(1戦)' },
+  'ばんのうぐすり': { name:'ばんのうぐすり', price:80,  type:'heal',  value:120, desc:'HP+120回復' },
+  'まなポーション': { name:'まなポーション', price:60,  type:'mpHeal',value:80,  desc:'MP+80回復' },
+};
+
+// バイオームごとのショップ品揃え
+const SHOP_STOCK = {
+  [BIOME.PLAIN]:   {
+    weapons: ['ひのきのぼう','どうのつるぎ','くさなぎのつるぎ'],
+    armors:  ['ぬののふく','かわのよろい','もりのよろい'],
+    items:   ['やくそう','どくけしそう','ばんのうぐすり'],
+  },
+  [BIOME.FOREST]:  {
+    weapons: ['どうのつるぎ','てつのつるぎ','まじゅつのつえ'],
+    armors:  ['かわのよろい','くさりかたびら','もりのよろい'],
+    items:   ['やくそう','どくけしそう','エリクサー','まなポーション'],
+  },
+  [BIOME.DESERT]:  {
+    weapons: ['てつのつるぎ','くさなぎのつるぎ','はがねのけん'],
+    armors:  ['くさりかたびら','てつのよろい'],
+    items:   ['やくそう','せいすい','ばんのうぐすり'],
+  },
+  [BIOME.SNOW]:    {
+    weapons: ['こおりのつるぎ','はがねのけん'],
+    armors:  ['こおりのよろい','まほうのよろい'],
+    items:   ['やくそう','エリクサー','せいすい','まなポーション'],
+  },
+  [BIOME.VOLCANO]: {
+    weapons: ['どくのやいば','ほのおのけん','りゅうのつるぎ'],
+    armors:  ['てつのよろい','まほうのよろい','りゅうのよろい'],
+    items:   ['エリクサー','せいすい','ばんのうぐすり'],
+  },
+  [BIOME.SWAMP]:   {
+    weapons: ['どうのつるぎ','てつのつるぎ','どくのやいば'],
+    armors:  ['かわのよろい','くさりかたびら','まじゅつのローブ'],
+    items:   ['やくそう','どくけしそう','まなポーション'],
+  },
+  [BIOME.COAST]:   {
+    weapons: ['ひのきのぼう','どうのつるぎ','まじゅつのつえ','くさなぎのつるぎ'],
+    armors:  ['ぬののふく','かわのよろい','みずのローブ','くさりかたびら'],
+    items:   ['やくそう','どくけしそう','エリクサー','まなポーション'],
+  },
+};
+
+// インベントリ操作
+function addItem(itemId, qty=1) {
+  const slot = player.inventory.find(s => s.itemId === itemId);
+  if (slot) slot.qty += qty;
+  else player.inventory.push({ itemId, qty });
+}
+function removeItem(itemId, qty=1) {
+  const idx = player.inventory.findIndex(s => s.itemId === itemId);
+  if (idx < 0) return false;
+  player.inventory[idx].qty -= qty;
+  if (player.inventory[idx].qty <= 0) player.inventory.splice(idx, 1);
+  return true;
+}
+function getItemQty(itemId) {
+  const slot = player.inventory.find(s => s.itemId === itemId);
+  return slot ? slot.qty : 0;
+}
+
+// アイテム使用
+function useItem(itemId) {
+  const m = ITEM_MASTER[itemId];
+  if (!m) return null;
+  if (!removeItem(itemId)) return null;
+  if (m.type === 'heal')   { const v=Math.min(player.maxHp,player.hp+m.value)-player.hp; player.hp+=v; return m.name+'を つかった！ HP+'+v; }
+  if (m.type === 'mpHeal') { const v=Math.min(player.maxMp,player.mp+m.value)-player.mp; player.mp+=v; return m.name+'を つかった！ MP+'+v; }
+  if (m.type === 'full')   { player.hp=player.maxHp; player.mp=player.maxMp; return m.name+'！ HP・MP かんぜんかいふく！'; }
+  if (m.type === 'atkUp')  { if (typeof battle !== 'undefined') battle.atkBuff=(battle.atkBuff||0)+m.value/10; return m.name+'！ こうげきりょく アップ！(次の戦闘で有効)'; }
+  return null;
+}
+
+// ===== ショップ・フィールドメニュー状態（resetGameより前に定義） =====
+const shop = {
+  active: false,
+  tab: 0,          // 0=武器 1=防具 2=アイテム
+  cursor: 0,
+  message: '',
+  messageTimer: 0,
+  biome: BIOME.PLAIN,
+};
+const fieldMenu = {
+  active: false,
+  tab: 0,          // 0=装備 1=アイテム
+  cursor: 0,
+  message: '',
+  messageTimer: 0,
+};
+
+// 施設メニュー状態
+const townMenu = {
+  active: false,
+  town: null,
+  cursor: 0,
+  message: '',
+  messageTimer: 0,
+};
+
+function expToNext(lv) { return lv * 15; }
+
+let lastStatGain    = { hp:0, mp:0, atk:0, def:0 };
+let lastLearnedSkills = []; // 今回のレベルアップで習得した技のid配列
+
+function tryLevelUp() {
+  let n = 0;
+  lastStatGain     = { hp:0, mp:0, atk:0, def:0 };
+  lastLearnedSkills = [];
+
+  while (player.exp >= expToNext(player.lv)) {
+    player.exp -= expToNext(player.lv);
+    player.lv++;
+
+    // ── ステータス上昇 ──
+    const hpUp  = 8 + Math.floor(player.lv * 1.5);
+    const mpUp  = 4 + Math.floor(player.lv * 0.8);
+    const atkUp = 2 + Math.floor(player.lv * 0.5);
+    const defUp = 1;
+    player.maxHp += hpUp; player.maxMp += mpUp;
+    player.atk   += atkUp; player.def  += defUp;
+    player.hp = player.maxHp; player.mp = player.maxMp;
+    lastStatGain.hp  += hpUp; lastStatGain.mp  += mpUp;
+    lastStatGain.atk += atkUp; lastStatGain.def += defUp;
+
+    // ── 技習得チェック：現在のLvに対応するエントリを走査 ──
+    // whileで1レベルずつ処理するため飛び級しても漏れなし
+    for (const entry of LEARN_MASTER) {
+      if (entry.lv !== player.lv) continue;
+      if (entry.type === 'attack') {
+        if (!player.learnedAttacks.includes(entry.id)) {
+          player.learnedAttacks.push(entry.id);
+          lastLearnedSkills.push(entry.id);
+        }
+      } else if (entry.type === 'magic') {
+        if (!player.learnedMagics.includes(entry.id)) {
+          player.learnedMagics.push(entry.id);
+          lastLearnedSkills.push(entry.id);
+        }
+      }
+    }
+    n++;
+  }
+  return n;
+}
+
+// ===== 敵テンプレート（バイオーム別） =====
+const ENEMY_TABLE = {
+  [BIOME.PLAIN]: [
+    {name:'スライム',   color:'#44AAFF', hp:22, atk:6,  def:0, baseExp:20,  coinDrop:15,  shape:'slime'   },
+    {name:'おおかみ',   color:'#AA8866', hp:28, atk:9,  def:1, baseExp:30,  coinDrop:25,  shape:'wolf'    },
+    {name:'ゴブリン',   color:'#66CC44', hp:25, atk:8,  def:1, baseExp:25,  coinDrop:20,  shape:'goblin'  },
+  ],
+  [BIOME.FOREST]: [
+    {name:'グリーンスライム',color:'#33CC66', hp:24, atk:7,  def:1, baseExp:22,  coinDrop:18,  shape:'slime'   },
+    {name:'おおかみ',   color:'#887755', hp:32, atk:11, def:2, baseExp:35,  coinDrop:30,  shape:'wolf'    },
+    {name:'ドライアド', color:'#228833', hp:38, atk:10, def:3, baseExp:45,  coinDrop:50,  shape:'dryad'   },
+  ],
+  [BIOME.DESERT]: [
+    {name:'サンドワーム',color:'#D4A830', hp:30, atk:10, def:2, baseExp:32,  coinDrop:35,  shape:'worm'   },
+    {name:'スコーピオン',color:'#CC8833', hp:26, atk:12, def:1, baseExp:35,  coinDrop:38,  shape:'scorpion'},
+    {name:'マミー',     color:'#C8B87A', hp:35, atk:9,  def:4, baseExp:40,  coinDrop:45,  shape:'mummy'  },
+  ],
+  [BIOME.SNOW]: [
+    {name:'アイスゴーレム',color:'#88CCEE', hp:40, atk:11, def:5, baseExp:45,  coinDrop:55,  shape:'golem' },
+    {name:'スノーウルフ', color:'#DDEEFF', hp:30, atk:13, def:2, baseExp:38,  coinDrop:40,  shape:'wolf'  },
+    {name:'ブリザード',  color:'#AACCFF', hp:28, atk:10, def:3, baseExp:40,  coinDrop:45,  shape:'ghost'  },
+  ],
+  [BIOME.VOLCANO]: [
+    {name:'サラマンダー',color:'#FF5522', hp:35, atk:14, def:3, baseExp:50,  coinDrop:65,  shape:'salamander'},
+    {name:'ラーヴァゴーレム',color:'#FF3300', hp:45, atk:12, def:6, baseExp:55,  coinDrop:80,  shape:'golem'},
+    {name:'ファイアドラゴン',color:'#CC2200', hp:50, atk:15, def:4, baseExp:70,  coinDrop:120, shape:'dragon'},
+  ],
+  [BIOME.SWAMP]: [
+    {name:'ゴースト',   color:'#AA88FF', hp:28, atk:9,  def:1, baseExp:35,  coinDrop:35,  shape:'ghost'  },
+    {name:'マッドクロール',color:'#6A8840', hp:32, atk:8,  def:3, baseExp:32,  coinDrop:30,  shape:'worm' },
+    {name:'ウィスプ',   color:'#88FFCC', hp:22, atk:11, def:0, baseExp:38,  coinDrop:40,  shape:'wisp'   },
+  ],
+  [BIOME.COAST]: [
+    {name:'クラーケン',  color:'#3366AA', hp:36, atk:10, def:2, baseExp:40,  coinDrop:50,  shape:'kraken' },
+    {name:'シーサーペント',color:'#228866', hp:30, atk:12, def:2, baseExp:38,  coinDrop:40,  shape:'worm' },
+    {name:'スライム',   color:'#44AAFF', hp:20, atk:6,  def:0, baseExp:18,  coinDrop:12,  shape:'slime'  },
+  ],
+};
+
+let enemy = null;
+let lastExpGain=0, lastLevelUp=0, lastCoinGain=0;
+
+// ===== 戦闘状態 =====
+const battle = {
+  phase:'command', commandCursor:0,
+  // 0=こうげき系, 1=じゅもん系
+  menuLevel: 0,          // 0=カテゴリ選択, 1=サブコマンド選択
+  categoryCursor: 0,     // カテゴリ選択カーソル
+  subCursor: 0,          // サブコマンド選択カーソル
+  commands:['こうげき','じゅもん'],
+  typingWord:'', typingTarget:'', typingIndex:0,
+  typingLimit:5000, typingMpCost:0,
+  typingStart:0, typingElapsed:0, typingSuccess:false,
+  message:'', messageTimer:0, messageDuration:90,
+  enemyPending:false,
+  atkBuff: 0,            // オーラ：次の攻撃ダメージ倍率加算（0.0〜1.0）
+  clockdownBuff: false,  // クロックダウン：次のタイピング制限時間+2秒
+  clockdownDebuff: false,// 魔王クロックダウン：次のタイピング制限時間-1.5秒
+  darknessDebuff: false, // 魔王ダークネス：タイピング文字を一部隠す
+  currentCmd: '',        // 現在実行中のコマンドid（finishTypingで参照）
+  // ===== ダメージリアクション =====
+  enemyShake: 0,         // 敵シェイク残フレーム数（>0の間横揺れ）
+  playerShake: 0,        // プレイヤーシェイク残フレーム数
+  enemyHitFlash: 0,      // 敵被弾赤フラッシュ残フレーム数
+  playerHitFlash: 0,     // プレイヤー被弾赤フラッシュ残フレーム数
+  // ===== バイオーム連動背景 =====
+  biome: 0,              // エンカウント時のバイオームID（drawBattleBackgroundで参照）
+  isBossBattle: false,   // ボス戦フラグ（専用背景に切り替え）
+};
+
+// こうげき系コマンド定義（全コマンド。表示は learnedAttacks でフィルタリング）
+const ATTACK_CMDS = [
+  { id:'kougeki',  key:'こうげき',   display:'こうげき',     roman:'kougeki',    limit:5000, mpCost:0, color:'#FFFFFF', desc:'ふつうのこうげき' },
+  { id:'renda',    key:'れんだ',     display:'れんだ',       roman:'renda',      limit:4000, mpCost:0, color:'#FFDD88', desc:'2連続ダメージ' },
+  { id:'mineuchi', key:'みねうち',   display:'みねうち',     roman:'mineuchi',   limit:4000, mpCost:0, color:'#AADDFF', desc:'威力低・敵をまひにする' },
+  { id:'dokugiri', key:'どくぎり',   display:'どくぎり',     roman:'dokugiri',   limit:5000, mpCost:0, color:'#88FF88', desc:'威力低・敵をどくにする' },
+  { id:'taiatari', key:'たいあたり', display:'たいあたり',   roman:'taiatari',   limit:5000, mpCost:0, color:'#FFAA66', desc:'大ダメージ・自分も8%ダメ' },
+];
+
+// じゅもん系コマンド定義（全コマンド。表示は learnedMagics でフィルタリング）
+const MAGIC_CMDS = [
+  { id:'frost',     key:'フロスト',       display:'フロスト',       roman:'frosuto',      limit:4000, mpCost:5,  color:'#88CCFF', desc:'氷の呪文ダメージ' },
+  { id:'heal',      key:'ヒール',         display:'ヒール',         roman:'hi-ru',        limit:5000, mpCost:6,  color:'#88FF88', desc:'HP 40%+8 回復' },
+  { id:'clockdown', key:'クロックダウン', display:'クロックダウン', roman:'kurokkudaun',  limit:4000, mpCost:4,  color:'#CCCCFF', desc:'タイピング時間+2秒' },
+  { id:'aura',      key:'オーラ',         display:'オーラ',         roman:'o-ra',         limit:5000, mpCost:10, color:'#FFFF66', desc:'次の攻撃を80%強化' },
+  { id:'ignis',     key:'イグニス',       display:'イグニス',       roman:'igunisu',      limit:5000, mpCost:8,  color:'#FF8844', desc:'炎の呪文・高威力' },
+];
+
+// ===== 技習得スケジュール =====
+const LEARN_MASTER = [
+  { lv:1,  type:'attack', id:'kougeki'   }, // 初期習得（resetGame で手動追加）
+  { lv:3,  type:'attack', id:'renda'     },
+  { lv:5,  type:'magic',  id:'frost'     },
+  { lv:7,  type:'attack', id:'mineuchi'  },
+  { lv:9,  type:'attack', id:'dokugiri'  },
+  { lv:11, type:'magic',  id:'heal'      },
+  { lv:13, type:'magic',  id:'clockdown' },
+  { lv:15, type:'attack', id:'taiatari'  },
+  { lv:17, type:'magic',  id:'aura'      },
+  { lv:20, type:'magic',  id:'ignis'     },
+];
+
+// typingWords: id → { display, roman, limit, mpCost } のルックアップテーブル
+// 全コマンドを登録しておき、実際の表示は learnedAttacks / learnedMagics でフィルタリング
+const typingWords = {};
+for (const c of [...ATTACK_CMDS, ...MAGIC_CMDS]) {
+  typingWords[c.id] = { display:c.display, roman:c.roman, limit:c.limit, mpCost:c.mpCost };
+}
+
+// 習得済みコマンドだけ返すフィルタ関数（戦闘UIと入力処理で使用）
+function getLearnedAttackCmds() {
+  return ATTACK_CMDS.filter(c => player.learnedAttacks.includes(c.id));
+}
+function getLearnedMagicCmds() {
+  return MAGIC_CMDS.filter(c => player.learnedMagics.includes(c.id));
+}
+
+// ===== 入力ハンドラ =====
+function onKeyDown(key) {
+  // ===== タイトル画面 =====
+  if (mode === 'title') {
+    const hasSave = hasSaveData();
+    // 表示項目数（セーブあり:3、セーブなし:2）
+    const itemCount = hasSave ? 3 : 2;
+
+    if (key === 'ArrowUp' || key === 'ArrowDown' || key === 'w' || key === 's') {
+      const dir = (key === 'ArrowDown' || key === 's') ? 1 : -1;
+      title.cursor = (title.cursor + dir + itemCount) % itemCount;
+    }
+    if (key === 'Enter' || key === ' ') {
+      // セーブなし時: 0=はじめから, 1=あそびかた
+      // セーブあり時: 0=はじめから, 1=つづきから, 2=あそびかた
+      const isHowTo = title.cursor === (hasSave ? 2 : 1);
+      const isContinue = hasSave && title.cursor === 1;
+
+      if (isHowTo) {
+        // あそびかた
+        mode = 'howtoplay';
+        bgmSyncToMode('howtoplay');
+      } else if (isContinue) {
+        // つづきから
+        if (!loadGame()) {
+          resetGame();
+          mode = 'field';
+          bgmSyncToMode('field');
+        }
+      } else {
+        // はじめから
+        deleteSaveData();
+        resetGame();
+        mode = 'field';
+        bgmSyncToMode('field');
+      }
+    }
+    return;
+  }
+
+  // ===== あそびかた画面 =====
+  if (mode === 'howtoplay') {
+    if (key === 'Enter' || key === ' ' || key === 'Escape') {
+      mode = 'title';
+    }
+    return;
+  }
+
+  // ===== ゲームクリア画面 =====
+  if (mode === 'gameclear') {
+    if ((key === 'Enter' || key === ' ') && gameclearTimer > 450) {
+      title.cursor = 0;
+      title.animTimer = 0;
+      mode = 'title';
+      bgmSyncToMode('title');
+    }
+    return;
+  }
+
+  if (mode === 'field') {
+    // ショップが開いている場合
+    if (shop.active) {
+      if (shop.messageTimer > 0) return;
+      const list = getShopList();
+      if (key === 'ArrowLeft')  { shop.tab = (shop.tab + 2) % 3; shop.cursor = 0; }
+      if (key === 'ArrowRight') { shop.tab = (shop.tab + 1) % 3; shop.cursor = 0; }
+      if (key === 'ArrowUp')    shop.cursor = (shop.cursor - 1 + list.length) % list.length;
+      if (key === 'ArrowDown')  shop.cursor = (shop.cursor + 1) % list.length;
+      if (key === 'Escape' || key === 'x' || key === 'X') { shop.active = false; }
+      if (key === 'Enter' || key === ' ') {
+        const item = list[shop.cursor];
+        if (!item) return;
+        if (player.coins < item.price) {
+          shop.message = 'コインが たりない！'; shop.messageTimer = 80;
+        } else {
+          player.coins -= item.price;
+          if (item.mtype === 'weapon') {
+            addItem(item.id);
+            player.equip.weapon = item.id;
+            shop.message = item.name + 'を かって そうびした！';
+          } else if (item.mtype === 'armor') {
+            addItem(item.id);
+            player.equip.armor = item.id;
+            shop.message = item.name + 'を かって そうびした！';
+          } else {
+            addItem(item.id);
+            shop.message = item.name + 'を かった！';
+          }
+          shop.messageTimer = 90;
+        }
+      }
+      return;
+    }
+    // フィールドメニューが開いている場合
+    if (fieldMenu.active) {
+      handleFieldMenuInput(key);
+      return;
+    }
+    // 施設メニューが開いている場合
+    if (townMenu.active) {
+      if (townMenu.messageTimer > 0) return;
+      const opts = getTownOptions(townMenu.town);
+      if (key === 'ArrowUp') {
+        townMenu.cursor = (townMenu.cursor - 1 + opts.length) % opts.length;
+      } else if (key === 'ArrowDown') {
+        townMenu.cursor = (townMenu.cursor + 1) % opts.length;
+      } else if (key === 'Enter' || key === ' ') {
+        useTownOption(townMenu.town, opts[townMenu.cursor].action);
+      }
+      return;
+    }
+    // Sキーで手動セーブ（ショップ・メニュー非表示時のみ）
+    if ((key === 's' || key === 'S') && !shop.active && !fieldMenu.active && !townMenu.active) {
+      const ok = saveGame();
+      saveNotify.msg   = ok ? '💾 セーブしました' : '❌ セーブに失敗しました';
+      saveNotify.timer = SAVE_NOTIFY_DURATION;
+      return;
+    }
+    // Bキーで BGM ON/OFF トグル（どのメニュー状態でも有効）
+    if (key === 'b' || key === 'B') {
+      bgm.enabled = !bgm.enabled;
+      if (bgm.enabled) {
+        bgmSyncToMode(mode); // 現在の mode に合わせて再開
+        saveNotify.msg = '🎵 BGM ON';
+      } else {
+        bgmStop();
+        saveNotify.msg = '🔇 BGM OFF';
+      }
+      saveNotify.timer = SAVE_NOTIFY_DURATION;
+      return;
+    }
+    // Mキーでフィールドメニューを開く
+    if (key === 'm' || key === 'M') {
+      fieldMenu.active = true; fieldMenu.tab = 0; fieldMenu.cursor = 0; fieldMenu.message = '';
+      return;
+    }
+    // 施設に近い場合、Enterでメニューを開く
+    const nearTown = getNearbyTown();
+    if ((key === 'Enter' || key === ' ') && nearTown) {
+      townMenu.active = true;
+      townMenu.town = nearTown;
+      townMenu.cursor = 0;
+      townMenu.message = '';
+      townMenu.messageTimer = 0;
+    }
+    // ボスに近い場合、Enterでボス戦開始
+    if ((key === 'Enter' || key === ' ') && BOSS_EVENT.isNear && !BOSS_EVENT.isDefeated) {
+      startBossFlash();
+    }
+  } else if (mode === 'battle') {
+    handleBattleInput(key);
+  } else if (mode === 'victory' || mode === 'gameover') {
+    if (key === 'Enter' || key === ' ') {
+      if (mode === 'victory') {
+        mode = 'field'; field.stepCount = 0; player.hp = player.maxHp;
+        bgmSyncToMode('field');
+      } else {
+        // ゲームオーバー → セーブデータがあればリトライ、なければタイトルへ
+        if (hasSaveData()) {
+          // セーブデータから復帰
+          if (loadGame()) {
+            retryFade.active = true;
+            retryFade.timer  = 0;
+            // BGMはフェード完了後に bgmSyncToMode('field') するため
+            // フェードイン中は無音にする（bgmStop は loadGame 内でリセット済み）
+            bgmStop();
+          } else {
+            // ロード失敗時はタイトルへ
+            resetGame();
+            title.cursor = 0; title.animTimer = 0;
+            mode = 'title';
+            bgmSyncToMode('title');
+          }
+        } else {
+          // セーブなし → タイトルへ戻る
+          resetGame();
+          title.cursor = 0; title.animTimer = 0;
+          mode = 'title';
+          bgmSyncToMode('title');
+        }
+      }
+    }
+  }
+}
+
+function startFlash() { mode='flash'; flash.timer=0; flash.phase=0; bgmSyncToMode('flash'); }
+function startBossFlash() { mode='flash'; flash.timer=0; flash.phase=0; flash.isBoss=true; bgmSyncToMode('flash'); }
+
+function getCurrentBiome() {
+  const tx=Math.round(field.px), ty=Math.round(field.py);
+  if (tx<0||ty<0||tx>=MAP_W||ty>=MAP_H) return BIOME.PLAIN;
+  return mapBiome[ty][tx];
+}
+
+function startBattle() {
+  const biome = getCurrentBiome();
+  const table = ENEMY_TABLE[biome] || ENEMY_TABLE[BIOME.PLAIN];
+  const tmpl  = table[Math.floor(Math.random()*table.length)];
+  const lv=player.lv, scale=1+(lv-1)*0.3;
+  enemy = {
+    ...tmpl,
+    lv, maxHp:Math.round(tmpl.hp*scale),
+    hp:Math.round(tmpl.hp*scale),
+    atk:Math.round(tmpl.atk*scale),
+    def:Math.round(tmpl.def*scale),
+    status:      null, // null | 'poison' | 'paralysis' | 'burn' | 'freeze' | 'shock'
+    statusTurns: 0,
+    burnDmg:     0,    // 炎: 毎ターンの持続ダメージ量
+    freezeDefMod:0,    // 氷: 凍結中の防御力補正（例: 0.7 = 30%減）
+  };
+  battle.phase='command'; battle.commandCursor=0;
+  battle.menuLevel=0; battle.categoryCursor=0; battle.subCursor=0;
+  battle.atkBuff=0; battle.clockdownBuff=false; battle.currentCmd='';
+  battle.biome = biome; battle.isBossBattle = false;
+  battle.message=tmpl.name+'(Lv'+lv+')があらわれた！';
+  battle.messageTimer=battle.messageDuration;
+  lastExpGain=0; lastLevelUp=0; lastCoinGain=0;
+  lastStatGain={hp:0,mp:0,atk:0,def:0};
+  mode='battle';
+  bgmSyncToMode('battle');
+}
+
+/** ボス（タイピング魔王）戦を開始する */
+function startBossBattle() {
+  enemy = {
+    name: 'タイピング魔王',
+    shape: 'demon_king',
+    isBoss: true,
+    lv: 30,
+    hp:    1500, maxHp: 1500,
+    mp:    100,  maxMp: 100,
+    atk:   45,
+    def:   20,
+    baseExp:  2000,
+    coinDrop: 2000,
+    status:      null,
+    statusTurns: 0,
+    burnDmg:     0,
+    freezeDefMod:0,
+  };
+  battle.phase='command'; battle.commandCursor=0;
+  battle.menuLevel=0; battle.categoryCursor=0; battle.subCursor=0;
+  battle.atkBuff=0; battle.clockdownBuff=false;
+  battle.clockdownDebuff=false; battle.darknessDebuff=false;
+  battle.currentCmd='';
+  battle.biome = BIOME.VOLCANO; battle.isBossBattle = true;
+  battle.message='タイピング魔王があらわれた！！';
+  battle.messageTimer=battle.messageDuration;
+  lastExpGain=0; lastLevelUp=0; lastCoinGain=0;
+  lastStatGain={hp:0,mp:0,atk:0,def:0};
+  mode='battle';
+  bgmSyncToMode('battle');
+}
+
+function handleBattleInput(key) {
+  if (battle.phase==='command') {
+    if (battle.messageTimer>0) return;
+
+    if (battle.menuLevel===0) {
+      // カテゴリ選択（こうげき系 / じゅもん系）
+      if (key==='ArrowUp'||key==='ArrowDown')
+        battle.categoryCursor = battle.categoryCursor===0?1:0;
+      if (key==='Enter'||key===' ') {
+        battle.menuLevel = 1;
+        battle.subCursor  = 0;
+      }
+    } else {
+      // サブコマンド選択
+      const list = battle.categoryCursor===0 ? getLearnedAttackCmds() : getLearnedMagicCmds();
+      if (key==='ArrowUp')
+        battle.subCursor = (battle.subCursor - 1 + list.length) % list.length;
+      if (key==='ArrowDown')
+        battle.subCursor = (battle.subCursor + 1) % list.length;
+      if (key==='Escape'||key==='x'||key==='X') {
+        // カテゴリ選択に戻る
+        battle.menuLevel = 0;
+      }
+      if (key==='Enter'||key===' ') {
+        startTyping(list[battle.subCursor].id);
+      }
+    }
+  } else if (battle.phase==='typing') {
+    if (key.length===1) {
+      const t=battle.typingTarget, i=battle.typingIndex;
+      if (i<t.length && key===t[i]) {
+        battle.typingIndex++;
+        if (battle.typingIndex>=t.length) {
+          seTypingSuccess(); // 全文字入力完了
+          finishTyping(true);
+        } else {
+          seTypingKey();     // 1文字正解
+        }
+      }
+      // 誤入力時は無音（ストレスを与えすぎない設計）
+    }
+  }
+}
+
+function startTyping(cmd) {
+  const word=typingWords[cmd];
+  if (word.mpCost>0 && player.mp<word.mpCost) {
+    battle.message='MPが たりない！ (必要: '+word.mpCost+')';
+    battle.messageTimer=battle.messageDuration;
+    return;
+  }
+  battle.typingWord=word.display; battle.typingTarget=word.roman;
+  battle.typingIndex=0;
+  // クロックダウン（プレイヤーバフ）+2秒、魔王クロックダウンデバフ -1.5秒
+  battle.typingLimit = word.limit
+    + (battle.clockdownBuff   ?  2000 : 0)
+    - (battle.clockdownDebuff ? 1500  : 0);
+  battle.typingLimit = Math.max(1500, battle.typingLimit); // 最低1.5秒は保証
+  battle.clockdownBuff   = false;
+  battle.clockdownDebuff = false;
+  battle.typingMpCost=word.mpCost;
+  battle.typingStart=performance.now(); battle.typingElapsed=0;
+  battle.typingSuccess=false; battle.phase='typing';
+  battle.menuLevel=0; // メニューをカテゴリ選択に戻す
+  battle.currentCmd=cmd; // 使用コマンドを記録
+}
+
+function finishTyping(success) {
+  battle.typingElapsed=performance.now()-battle.typingStart;
+  if (!success) {
+    seTypingFail(); // 失敗SE
+    setBattleMessage('タイピング失敗！ダメージ0！',true);
+    return;
+  }
+
+  const ratio=battle.typingElapsed/battle.typingLimit;
+  const cmd=battle.currentCmd||'kougeki';
+  const atkMod=(playerAtk()/10)*(1+(battle.atkBuff||0));
+
+  // タイピング速度ボーナス
+  let speedMult, speedPrefix;
+  if (ratio<0.3)      { speedMult=1.5; speedPrefix='会心の一撃！ '; }
+  else if (ratio<0.7) { speedMult=1.0; speedPrefix=''; }
+  else                { speedMult=0.6; speedPrefix='ギリギリ… '; }
+
+  player.mp=Math.max(0,player.mp-(battle.typingMpCost||0));
+  // aura 以外でバフ消費
+  const consumesBuff = (cmd!=='aura');
+  const usedBuff = battle.atkBuff;
+  if (consumesBuff) battle.atkBuff=0;
+
+  let msg='';
+
+  // ===== こうげき系（id ベース） =====
+  if (cmd==='kougeki') {
+    const base=15+Math.floor(Math.random()*11);
+    const dmg=Math.max(1,Math.round(base*atkMod*speedMult)-(enemy.def||0));
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    msg=speedPrefix+'こうげき！ '+dmg+'ダメージ！';
+    msg = tryWeaponElement(msg);
+    spawnEffect('kougeki');
+
+  } else if (cmd==='renda') {
+    const b1=10+Math.floor(Math.random()*6);
+    const b2=8 +Math.floor(Math.random()*6);
+    const d1=Math.max(1,Math.round(b1*atkMod*speedMult)-(enemy.def||0));
+    const d2=Math.max(1,Math.round(b2*atkMod*speedMult)-(enemy.def||0));
+    enemy.hp=Math.max(0,enemy.hp-d1-d2);
+    msg=speedPrefix+'れんだ！ '+d1+'+'+d2+'ダメージ！';
+    msg = tryWeaponElement(msg);
+    spawnEffect('renda');
+
+  } else if (cmd==='mineuchi') {
+    const base=12+Math.floor(Math.random()*6);
+    const dmg=Math.max(1,Math.round(base*atkMod*speedMult*0.5)-(enemy.def||0));
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    // まひ付与（敵がすでに状態異常でも上書き）
+    enemy.status='paralysis'; enemy.statusTurns=2;
+    msg=speedPrefix+'みねうち！ '+dmg+'ダメージ！ 敵はまひした！';
+    spawnEffect('mineuchi');
+
+  } else if (cmd==='dokugiri') {
+    const base=12+Math.floor(Math.random()*6);
+    const dmg=Math.max(1,Math.round(base*atkMod*speedMult*0.4)-(enemy.def||0));
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    // どく付与（敵がすでに状態異常でも上書き）
+    enemy.status='poison'; enemy.statusTurns=5;
+    msg=speedPrefix+'どくぎり！ '+dmg+'ダメージ！ 敵はどくになった！';
+    spawnEffect('dokugiri');
+
+  } else if (cmd==='taiatari') {
+    const base=28+Math.floor(Math.random()*16);
+    const dmg=Math.max(1,Math.round(base*atkMod*speedMult)-(enemy.def||0));
+    const self=Math.floor(player.maxHp*0.08);
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    player.hp=Math.max(0,player.hp-self);
+    msg=speedPrefix+'たいあたり！ '+dmg+'ダメージ！ (-'+self+'HP)';
+    msg = tryWeaponElement(msg);
+    spawnEffect('taiatari');
+    if (player.hp<=0) {
+      setBattleMessage(msg,false);
+      return;
+    }
+
+  // ===== じゅもん系（id ベース） =====
+  } else if (cmd==='frost') {
+    const base=14+Math.floor(Math.random()*8);
+    const magMod=player.atk/10;
+    const dmg=Math.max(1,Math.round(base*magMod*speedMult));
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    msg=speedPrefix+'フロスト！ 氷の呪文！ '+dmg+'ダメージ！';
+    msg += applyElementEffect('freeze');
+    spawnEffect('frost');
+
+  } else if (cmd==='heal') {
+    const h=Math.floor(player.maxHp*0.4+8);
+    player.hp=Math.min(player.maxHp,player.hp+h);
+    msg='ヒール！ HP+'+h+' かいふく！';
+    spawnEffect('heal');
+
+  } else if (cmd==='clockdown') {
+    battle.clockdownBuff=true;
+    msg='クロックダウン！ 次のタイピング時間が延びた！';
+    spawnEffect('clockdown');
+
+  } else if (cmd==='aura') {
+    battle.atkBuff=0.8;
+    msg='オーラ！ 次の攻撃が強化された！';
+    spawnEffect('aura');
+
+  } else if (cmd==='ignis') {
+    const base=22+Math.floor(Math.random()*12);
+    const magMod=player.atk/10;
+    const dmg=Math.max(1,Math.round(base*magMod*speedMult*1.3));
+    enemy.hp=Math.max(0,enemy.hp-dmg);
+    msg=speedPrefix+'イグニス！ 炎の呪文！ '+dmg+'ダメージ！';
+    msg += applyElementEffect('burn');
+    spawnEffect('ignis');
+  }
+
+  // 敵にダメージを与えた攻撃はシェイク＋被弾フラッシュを発火
+  const dealsDmg = ['kougeki','renda','mineuchi','dokugiri','taiatari','frost','ignis'];
+  if (dealsDmg.includes(cmd)) {
+    battle.enemyShake     = 14; // 約14フレーム横揺れ
+    battle.enemyHitFlash  = 8;  // 約8フレーム赤フラッシュ
+  }
+
+  setBattleMessage(msg, true);
+}
+
+// シェイク量を返すヘルパー（shakeFramesが>0の間、サイン波で横オフセットを生成）
+function calcShake(frames, maxAmp) {
+  if (frames <= 0) return 0;
+  return Math.sin(frames * 1.8) * maxAmp * Math.min(1, frames / 6);
+}
+
+// ========== 属性効果付与 ==========
+// element: 'burn' | 'freeze' | 'shock'
+// 呼び出し元で enemy.hp <= 0 チェック後に呼ぶこと
+function applyElementEffect(element) {
+  if (!element || !enemy) return '';
+  switch (element) {
+    case 'burn':
+      // 炎：3ターン持続ダメージ（最大HPの6%/T）
+      // burn は poison より優先して上書き
+      if (enemy.status !== 'freeze') {
+        const bd = Math.max(1, Math.floor(enemy.maxHp * 0.06));
+        enemy.status = 'burn';
+        enemy.statusTurns = 3;
+        enemy.burnDmg = bd;
+        return ' 🔥もえている！(' + bd + '/T×3)';
+      }
+      return '';
+    case 'freeze':
+      // 氷：1ターン行動不能 + 防御力30%減
+      enemy.status = 'freeze';
+      enemy.statusTurns = 1;
+      enemy.freezeDefMod = 0.7; // 凍結中は def×0.7 で計算
+      return ' 🧊こおった！(1T行動不能 DEF-30%)';
+    case 'shock':
+      // 雷：2ターンまひ（paralysisと同等）
+      if (enemy.status !== 'freeze') {
+        enemy.status = 'shock';
+        enemy.statusTurns = 2;
+        return ' ⚡かんでんした！(2Tまひ)';
+      }
+      return '';
+    default:
+      return '';
+  }
+}
+
+// 武器の属性を通常攻撃に乗せる（こうげき/れんだ/たいあたり 系で呼ぶ）
+// 確率判定して属性メッセージを返す
+function tryWeaponElement(msgSuffix) {
+  const wid = player.equip.weapon;
+  if (!wid) return msgSuffix;
+  const wm = WEAPON_MASTER[wid];
+  if (!wm || !wm.element) return msgSuffix;
+  if (Math.random() < (wm.elemChance || 0)) {
+    msgSuffix += applyElementEffect(wm.element);
+  }
+  return msgSuffix;
+}
+
+function setBattleMessage(msg,enemyNext) {
+  battle.message=msg; battle.messageTimer=battle.messageDuration;
+  battle.phase='result_player'; battle.enemyPending=enemyNext;
+}
+
+function enemyAttack() {
+
+  // ===== 凍結（freeze）：1ターン行動完全スキップ（40%/Tで早期解除） =====
+  if (enemy.status === 'freeze') {
+    const breakFrozen = Math.random() < 0.40;
+    enemy.statusTurns--;
+    if (enemy.statusTurns <= 0 || breakFrozen) {
+      enemy.status = null; enemy.statusTurns = 0; enemy.freezeDefMod = 0;
+      const brMsg = breakFrozen ? '（こおりがとけた！）' : '';
+      battle.message = enemy.name + ' はこおりついて うごけない！ 🧊 ' + brMsg;
+    } else {
+      battle.message = enemy.name + ' はこおりついて うごけない！ 🧊';
+    }
+    battle.messageTimer = battle.messageDuration;
+    battle.phase = 'result_enemy';
+    battle.enemyPending = false;
+    spawnEffect('frost');
+    return;
+  }
+
+  // ===== 雷（shock）：まひと同等（25%/Tで早期解除） =====
+  if (enemy.status === 'shock') {
+    const breakShock = Math.random() < 0.25;
+    enemy.statusTurns--;
+    if (enemy.statusTurns <= 0 || breakShock) {
+      enemy.status = null; enemy.statusTurns = 0;
+      const brMsg = breakShock ? '（かんでんがおさまった！）' : '';
+      battle.message = enemy.name + ' はかんでんして うごけない！ ⚡ ' + brMsg;
+    } else {
+      battle.message = enemy.name + ' はかんでんして うごけない！ ⚡';
+    }
+    battle.messageTimer = battle.messageDuration;
+    battle.phase = 'result_enemy';
+    battle.enemyPending = false;
+    return;
+  }
+
+  // ===== まひ（paralysis）：行動スキップ（25%/Tで早期解除） =====
+  if (enemy.status === 'paralysis') {
+    const breakPara = Math.random() < 0.25;
+    enemy.statusTurns--;
+    if (enemy.statusTurns <= 0 || breakPara) {
+      enemy.status = null; enemy.statusTurns = 0;
+      const brMsg = breakPara ? '（まひがとけた！）' : '';
+      battle.message = enemy.name + ' はまひして うごけない！ ' + brMsg;
+    } else {
+      battle.message = enemy.name + ' はまひして うごけない！';
+    }
+    battle.messageTimer = battle.messageDuration;
+    battle.phase = 'result_enemy';
+    battle.enemyPending = false;
+    return;
+  }
+
+  // ===== 炎（burn）：ターン開始時に持続ダメージ（30%/Tで早期解除） =====
+  let burnMsg = '';
+  if (enemy.status === 'burn') {
+    const breakBurn = Math.random() < 0.30;
+    const bdmg = enemy.burnDmg || Math.max(1, Math.floor(enemy.maxHp * 0.06));
+    enemy.hp = Math.max(0, enemy.hp - bdmg);
+    enemy.statusTurns--;
+    if (enemy.statusTurns <= 0 || breakBurn) {
+      enemy.status = null; enemy.statusTurns = 0; enemy.burnDmg = 0;
+      burnMsg = ' 🔥【やけど ' + bdmg + 'ダメ】（ほのおがきえた！）';
+    } else {
+      burnMsg = ' 🔥【やけど ' + bdmg + 'ダメ】';
+    }
+    spawnEffect('ignis');
+    if (enemy.hp <= 0) {
+      battle.message = enemy.name + ' はやけどでたおれた！' + burnMsg;
+      battle.messageTimer = battle.messageDuration;
+      battle.phase = 'result_player';
+      battle.enemyPending = false;
+      return;
+    }
+  }
+
+  // ===== どく：攻撃前にどくダメージ（20%/Tで早期解除） =====
+  let poisonMsg = '';
+  if (enemy.status === 'poison') {
+    const breakPoison = Math.random() < 0.20;
+    const pdmg = Math.max(1, Math.floor(enemy.maxHp * 0.08));
+    enemy.hp   = Math.max(0, enemy.hp - pdmg);
+    enemy.statusTurns--;
+    if (enemy.statusTurns <= 0 || breakPoison) {
+      enemy.status = null; enemy.statusTurns = 0;
+      poisonMsg = ' 【どく ' + pdmg + 'ダメージ】（どくがきえた！）';
+    } else {
+      poisonMsg = ' 【どく ' + pdmg + 'ダメージ】';
+    }
+
+    // どくで敵HP0 → 勝利扱いにするため result_player フェーズへ委譲
+    if (enemy.hp <= 0) {
+      battle.message = enemy.name + ' はどくでたおれた！' + poisonMsg;
+      battle.messageTimer = battle.messageDuration;
+      battle.phase = 'result_player'; // gameLoop の勝利判定に乗せる
+      battle.enemyPending = false;
+      return;
+    }
+  }
+
+  // ===== ボス（魔王）専用AI =====
+  if (enemy.isBoss) {
+    // MP不足チェックヘルパー
+    const canUseMP = (cost) => enemy.mp >= cost;
+
+    // 条件1: HP30%以下かつ30%の確率でヒール（MP6）
+    if (enemy.hp / enemy.maxHp <= 0.3 && Math.random() < 0.3 && canUseMP(6)) {
+      enemy.mp   -= 6;
+      enemy.hp    = Math.min(enemy.maxHp, enemy.hp + 200);
+      battle.message = '魔王は 『ヒール』 を唱えた！ HP+200！';
+      battle.messageTimer = battle.messageDuration;
+      battle.phase = 'result_enemy';
+      battle.enemyPending = false;
+      spawnEffect('heal');
+      return;
+    }
+
+    // 条件2: その他の行動（確率分岐）
+    const roll = Math.random();
+    if (roll < 0.40 || !canUseMP(4)) {
+      // 40% or MP切れ → 通常こうげき
+      const dmg = Math.max(1, (enemy.atk||45) - playerDef());
+      player.hp  = Math.max(0, player.hp - dmg);
+      seDamageReceived();
+      battle.playerShake = 14; battle.playerHitFlash = 8;
+      battle.message = '魔王のこうげき！ ' + dmg + 'ダメージ！' + poisonMsg;
+      spawnEffect('enemy_attack');
+    } else if (roll < 0.60 && canUseMP(8)) {
+      // 20% → イグニス（MP8）
+      enemy.mp -= 8;
+      const base = 22 + Math.floor(Math.random()*12);
+      const dmg  = Math.max(1, Math.round(base * (enemy.atk/10) * 1.5));
+      player.hp  = Math.max(0, player.hp - dmg);
+      seDamageReceived();
+      battle.playerShake = 18; battle.playerHitFlash = 12;
+      battle.message = '魔王の 『イグニス』！ 炎の呪文！ ' + dmg + 'ダメージ！';
+      spawnEffect('ignis');
+    } else if (roll < 0.80 && canUseMP(4)) {
+      // 20% → クロックダウン（MP4）：プレイヤーのタイピング時間-1.5秒
+      enemy.mp -= 4;
+      battle.clockdownDebuff = true;
+      battle.message = '魔王の 『クロックダウン』！ タイピング時間が縮んだ！';
+      spawnEffect('clockdown');
+    } else if (canUseMP(5)) {
+      // 20% → ダークネス（MP5）：次のタイピング文字を一部隠す
+      enemy.mp -= 5;
+      battle.darknessDebuff = true;
+      battle.message = '魔王の 『ダークネス』！ 闇に包まれた！ 文字が見えない！';
+      spawnEffect('darkness');
+    } else {
+      // MP不足フォールバック → こうげき
+      const dmg = Math.max(1, (enemy.atk||45) - playerDef());
+      player.hp  = Math.max(0, player.hp - dmg);
+      seDamageReceived();
+      battle.message = '魔王のこうげき！ ' + dmg + 'ダメージ！';
+      spawnEffect('enemy_attack');
+    }
+
+    battle.messageTimer  = battle.messageDuration;
+    battle.phase         = 'result_enemy';
+    battle.enemyPending  = false;
+    return;
+  }
+
+  // ===== 通常攻撃 =====
+  const dmg = Math.max(1, (enemy.atk||10) - playerDef());
+  player.hp  = Math.max(0, player.hp - dmg);
+  seDamageReceived();
+  // プレイヤー被弾シェイク＋フラッシュ
+  battle.playerShake    = 14;
+  battle.playerHitFlash = 8;
+  battle.message = enemy.name + ' のこうげき！ ' + dmg + 'ダメージ！' + poisonMsg;
+  battle.messageTimer = battle.messageDuration;
+  battle.phase = 'result_enemy';
+  battle.enemyPending = false;
+  // 敵攻撃エフェクト
+  spawnEffect('enemy_attack');
+}
+
+// ===== 戦闘エフェクトシステム =====
+const effects = []; // { type, particles:[], timer, duration }
+
+// 敵の中心座標（エフェクトの基準点）
+const EX = W/2+40, EY = H*0.35;
+// プレイヤーの中心座標
+const PX = W/4,    PY = H*0.42;
+
+function spawnEffect(type) {
+  const now = performance.now();
+  const p = [];
+  switch(type) {
+    case 'kougeki':
+      // 白い斬撃線3本
+      for (let i=0;i<3;i++) {
+        const angle = -0.4 + i*0.4;
+        p.push({x:EX-20+i*8, y:EY-10, vx:60*Math.cos(angle), vy:-40+i*10,
+                life:1, maxLife:1, type:'slash', angle});
+      }
+      break;
+    case 'renda':
+      // 黄色打撃フラッシュ2発
+      for (let i=0;i<2;i++) {
+        p.push({x:EX+(i*20-10), y:EY, vx:0, vy:0, life:1, maxLife:1, delay:i*8,
+                type:'impact', color:'#FFDD44'});
+      }
+      break;
+    case 'mineuchi':
+      // 水色の斬撃線（みねうち：弱め）
+      for (let i=0;i<2;i++) {
+        const angle = -0.3 + i*0.6;
+        p.push({x:EX-10+i*12, y:EY-5, vx:40*Math.cos(angle), vy:-30+i*10,
+                life:1, maxLife:1, type:'slash', angle, color:'#AADDFF'});
+      }
+      break;
+    case 'dokugiri':
+      // 緑の毒しぶき
+      for (let i=0;i<10;i++) {
+        p.push({x:EX+(Math.random()-0.5)*20, y:EY,
+                vx:(Math.random()-0.5)*2.5, vy:-(1+Math.random()*3),
+                life:1, maxLife:1, size:3+Math.random()*5,
+                type:'fire', color:'#44FF44'});
+      }
+      break;
+    case 'taiatari':
+      // オレンジの衝撃波リング
+      for (let i=0;i<12;i++) {
+        const a = (i/12)*Math.PI*2;
+        p.push({x:EX, y:EY, vx:Math.cos(a)*3, vy:Math.sin(a)*1.5,
+                life:1, maxLife:1, type:'ring', color:'#FF8800'});
+      }
+      break;
+    case 'frost':
+      // 青い氷の結晶
+      for (let i=0;i<16;i++) {
+        const a = (i/16)*Math.PI*2;
+        p.push({x:EX, y:EY, vx:Math.cos(a)*2.5, vy:Math.sin(a)*1.2,
+                life:1, maxLife:1, type:'ice',
+                color:['#AADDFF','#88CCFF','#FFFFFF'][Math.floor(Math.random()*3)]});
+      }
+      break;
+    case 'heal':
+      // 緑の光玉が上昇
+      for (let i=0;i<12;i++) {
+        p.push({x:PX+(Math.random()-0.5)*40, y:PY+10,
+                vx:(Math.random()-0.5)*1.5, vy:-(1.5+Math.random()*2.5),
+                life:1, maxLife:1, size:3+Math.random()*5,
+                type:'fire', color:['#44FF88','#88FFAA','#FFFFFF'][Math.floor(Math.random()*3)]});
+      }
+      break;
+    case 'clockdown':
+      // 水色の時計エフェクト（円弧放射）
+      for (let i=0;i<16;i++) {
+        const a = (i/16)*Math.PI*2;
+        p.push({x:EX, y:EY, vx:Math.cos(a)*2, vy:Math.sin(a)*1,
+                life:1, maxLife:1, type:'ice', color:'#CCCCFF'});
+      }
+      break;
+    case 'aura':
+      // 金色オーラ（プレイヤー周囲に広がる円弧）
+      for (let i=0;i<20;i++) {
+        const a = (i/20)*Math.PI*2;
+        p.push({x:PX+Math.cos(a)*20, y:PY+Math.sin(a)*10,
+                vx:Math.cos(a)*1.5, vy:Math.sin(a)*0.8,
+                life:1, maxLife:1, type:'aura', color:'#FFD700'});
+      }
+      break;
+    case 'ignis':
+      // 炎パーティクル群
+      for (let i=0;i<20;i++) {
+        p.push({x:EX+(Math.random()-0.5)*30, y:EY+20,
+                vx:(Math.random()-0.5)*3, vy:-(2+Math.random()*4),
+                life:1, maxLife:1, size:4+Math.random()*8,
+                type:'fire', color:['#FF2200','#FF6600','#FFAA00','#FFEE00'][Math.floor(Math.random()*4)]});
+      }
+      break;
+    case 'enemy_attack':
+      // 赤い爪傷線
+      for (let i=0;i<3;i++) {
+        p.push({x:PX-15+i*12, y:PY-15, vx:20, vy:25+i*5,
+                life:1, maxLife:1, type:'claw', angle:-0.5+i*0.4});
+      }
+      break;
+    case 'darkness':
+      // 紫黒の闇パーティクル
+      for (let i=0;i<18;i++) {
+        const a = (i/18)*Math.PI*2;
+        p.push({x:PX+Math.cos(a)*25, y:PY+Math.sin(a)*12,
+                vx:Math.cos(a)*1.2, vy:Math.sin(a)*0.6,
+                life:1, maxLife:1, type:'ring', color:'#880088'});
+      }
+      break;
+  }
+  effects.push({ type, particles:p, timer:0, duration:35 });
+}
+
+function updateEffects(dt) {
+  for (let i=effects.length-1;i>=0;i--) {
+    const ef=effects[i];
+    ef.timer++;
+    const progress=ef.timer/ef.duration; // 0→1
+    for (const p of ef.particles) {
+      if (p.delay && ef.timer < p.delay) continue;
+      p.life = 1 - progress;
+      p.x += p.vx * (dt/16);
+      p.y += p.vy * (dt/16);
+    }
+    if (ef.timer >= ef.duration) effects.splice(i,1);
+  }
+}
+
+function drawEffects() {
+  for (const ef of effects) {
+    const progress = ef.timer/ef.duration;
+    ctx.save();
+    for (const p of ef.particles) {
+      if (p.delay && ef.timer < p.delay) continue;
+      ctx.globalAlpha = Math.max(0, p.life * (1-progress*0.3));
+
+      switch(p.type) {
+        case 'slash': {
+          // 斬撃線：太い白いストローク
+          ctx.strokeStyle='#FFFFFF';
+          ctx.lineWidth=3*(1-progress)+1;
+          ctx.lineCap='round';
+          const len=35*(1-progress*0.5);
+          ctx.beginPath();
+          ctx.moveTo(p.x - Math.cos(p.angle)*len, p.y - Math.sin(p.angle)*len);
+          ctx.lineTo(p.x + Math.cos(p.angle)*len, p.y + Math.sin(p.angle)*len);
+          ctx.stroke();
+          // 白いグロー
+          ctx.strokeStyle='rgba(255,255,255,0.3)';
+          ctx.lineWidth=8*(1-progress);
+          ctx.beginPath();
+          ctx.moveTo(p.x - Math.cos(p.angle)*len, p.y - Math.sin(p.angle)*len);
+          ctx.lineTo(p.x + Math.cos(p.angle)*len, p.y + Math.sin(p.angle)*len);
+          ctx.stroke();
+          break;
+        }
+        case 'impact': {
+          // 打撃フラッシュ：広がる多角形
+          const r=20+progress*25;
+          ctx.fillStyle=p.color;
+          ctx.beginPath();
+          for (let k=0;k<6;k++) {
+            const a=(k/6)*Math.PI*2 + progress*0.5;
+            k===0 ? ctx.moveTo(p.x+Math.cos(a)*r, p.y+Math.sin(a)*r*0.6)
+                  : ctx.lineTo(p.x+Math.cos(a)*r, p.y+Math.sin(a)*r*0.6);
+          }
+          ctx.closePath(); ctx.fill();
+          break;
+        }
+        case 'ring': {
+          // 衝撃波リング：輪郭の円
+          ctx.fillStyle=p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 3*(1-progress*0.5), 0, Math.PI*2);
+          ctx.fill();
+          break;
+        }
+        case 'fire': {
+          // 炎：上に伸びる丸
+          ctx.fillStyle=p.color;
+          ctx.beginPath();
+          ctx.ellipse(p.x, p.y, (p.size||6)*(1-progress*0.5), (p.size||6)*(1+progress), 0, 0, Math.PI*2);
+          ctx.fill();
+          break;
+        }
+        case 'ice': {
+          // 氷の結晶：小さな菱形
+          const s=5*(1-progress*0.3);
+          ctx.fillStyle=p.color;
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y-s); ctx.lineTo(p.x+s*0.5, p.y);
+          ctx.lineTo(p.x, p.y+s); ctx.lineTo(p.x-s*0.5, p.y);
+          ctx.closePath(); ctx.fill();
+          // 十字
+          ctx.strokeStyle=p.color; ctx.lineWidth=1;
+          ctx.beginPath(); ctx.moveTo(p.x-s, p.y); ctx.lineTo(p.x+s, p.y); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(p.x, p.y-s); ctx.lineTo(p.x, p.y+s); ctx.stroke();
+          break;
+        }
+        case 'heal': {
+          // 回復：輝く丸
+          ctx.fillStyle=p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, (p.size||4)*(1-progress*0.3), 0, Math.PI*2);
+          ctx.fill();
+          // グロー
+          ctx.fillStyle='rgba(100,255,150,0.2)';
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, (p.size||4)*2*(1-progress*0.3), 0, Math.PI*2);
+          ctx.fill();
+          break;
+        }
+        case 'aura': {
+          // バイキルトオーラ：輝く点が広がる
+          ctx.fillStyle=p.color;
+          const s=4*(1-progress*0.5);
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, s, 0, Math.PI*2);
+          ctx.fill();
+          break;
+        }
+        case 'claw': {
+          // 爪傷：赤い斜め線
+          ctx.strokeStyle='#FF2222';
+          ctx.lineWidth=3*(1-progress*0.5)+1;
+          ctx.lineCap='round';
+          const len=30;
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p.x+Math.cos(p.angle)*len, p.y+Math.sin(p.angle)*len);
+          ctx.stroke();
+          // 赤いグロー
+          ctx.strokeStyle='rgba(255,50,50,0.3)';
+          ctx.lineWidth=8*(1-progress);
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p.x+Math.cos(p.angle)*len, p.y+Math.sin(p.angle)*len);
+          ctx.stroke();
+          break;
+        }
+      }
+    }
+    ctx.restore();
+  }
+}
+
+// ===== ミニマップ描画 =====
+// バイオームID → ミニマップ表示色
+const MINIMAP_BIOME_COLOR = [
+  '#4A9A50', // 0 平原：緑
+  '#2A6A28', // 1 森：濃緑
+  '#C8A840', // 2 砂漠：黄砂
+  '#C8D8F0', // 3 雪原：白青
+  '#2A1808', // 4 火山：黒
+  '#3A5028', // 5 湿地：暗緑
+  '#60A8C0', // 6 海岸：水色
+];
+const MINIMAP_WATER_COLOR = '#2060A0'; // tileId=70 水
+const MINIMAP_LAVA_COLOR  = '#CC3300'; // tileId=71 溶岩
+
+// ミニマップはキャッシュ用OffscreenCanvas（またはHTMLCanvasElement）に事前描画し
+// プレイヤー移動のたびに再描画するコストを避ける。
+// ただしOffscreenCanvasが使えない環境を考慮し、通常Canvasでフォールバックする。
+let _minimapCache = null;       // キャッシュCanvas
+let _minimapDirty = true;       // true のとき次フレームで再生成
+
+/** キャッシュが無効なとき（マップ変更時など）に呼んでキャッシュを破棄する */
+function invalidateMinimap() {
+  _minimapDirty = true;
+}
+
+/**
+ * 地形ベース（バイオーム色）のミニマップキャッシュを生成する。
+ * プレイヤー・村・宿などの動的要素はキャッシュしない。
+ */
+function _buildMinimapCache(dotSize) {
+  const cw = MAP_W * dotSize;
+  const ch = MAP_H * dotSize;
+
+  // キャッシュ先のCanvas（OffscreenCanvas 優先、なければ通常Canvas）
+  let cache;
+  try {
+    cache = new OffscreenCanvas(cw, ch);
+  } catch (_) {
+    cache = document.createElement('canvas');
+    cache.width  = cw;
+    cache.height = ch;
+  }
+  const c2 = cache.getContext('2d');
+
+  for (let ty = 0; ty < MAP_H; ty++) {
+    for (let tx = 0; tx < MAP_W; tx++) {
+      const tid   = mapTiles[ty][tx];
+      const biome = mapBiome[ty][tx];
+
+      if (tid === 70) {
+        c2.fillStyle = MINIMAP_WATER_COLOR;
+      } else if (tid === 71) {
+        c2.fillStyle = MINIMAP_LAVA_COLOR;
+      } else {
+        c2.fillStyle = MINIMAP_BIOME_COLOR[biome] || '#888888';
+      }
+      c2.fillRect(tx * dotSize, ty * dotSize, dotSize, dotSize);
+    }
+  }
+
+  // 村・宿屋をキャッシュ時点で描いておく（静的なので問題なし）
+  for (const t of mapTowns) {
+    c2.fillStyle = t.type === 'village' ? '#FFEE44' : '#44AAFF';
+    // 2×2 ドットで描画（dotSize=2 のとき 4px 四方）
+    c2.fillRect(t.tx * dotSize - 1, t.ty * dotSize - 1, dotSize + 1, dotSize + 1);
+  }
+
+  return cache;
+}
+
+/**
+ * ミニマップをメインキャンバスに描画する。
+ * @param {number} ox  ミニマップ左上X（メインキャンバス座標）
+ * @param {number} oy  ミニマップ左上Y（メインキャンバス座標）
+ */
+function drawMinimap(ox, oy) {
+  const dotSize  = 2;                    // 1タイルあたりのドットサイズ(px)
+  const mmW      = MAP_W * dotSize;      // 160px
+  const mmH      = MAP_H * dotSize;      // 160px
+  const padding  = 4;                    // 枠の内側パディング
+  const frameW   = mmW + padding * 2;
+  const frameH   = mmH + padding * 2;
+
+  // ---- 背景フレーム ----
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(ox, oy, frameW, frameH);
+  ctx.strokeStyle = 'rgba(200,200,200,0.6)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(ox + 0.5, oy + 0.5, frameW - 1, frameH - 1);
+
+  // ---- 地形キャッシュの生成・描画 ----
+  if (_minimapDirty || !_minimapCache) {
+    _minimapCache = _buildMinimapCache(dotSize);
+    _minimapDirty = false;
+  }
+
+  const drawX = ox + padding;
+  const drawY = oy + padding;
+
+  // OffscreenCanvas / HTMLCanvasElement のどちらでも drawImage で描ける
+  ctx.drawImage(_minimapCache, drawX, drawY);
+
+  // ---- プレイヤー位置（赤い輝点） ----
+  const px = drawX + Math.round(field.px) * dotSize;
+  const py = drawY + Math.round(field.py) * dotSize;
+
+  // グロー
+  ctx.fillStyle = 'rgba(255,80,80,0.35)';
+  ctx.fillRect(px - 2, py - 2, dotSize + 4, dotSize + 4);
+  // 本体
+  ctx.fillStyle = '#FF3333';
+  ctx.fillRect(px, py, dotSize, dotSize);
+
+  // ---- ボス位置（生存中のみ紫ドット） ----
+  if (!BOSS_EVENT.isDefeated) {
+    const bx = drawX + BOSS_EVENT.tx * dotSize;
+    const by = drawY + BOSS_EVENT.ty * dotSize;
+    // グロー（点滅）
+    const blink = Math.floor(Date.now() / 400) % 2 === 0;
+    ctx.fillStyle = blink ? 'rgba(255,0,255,0.5)' : 'rgba(120,0,120,0.3)';
+    ctx.fillRect(bx - 2, by - 2, dotSize + 4, dotSize + 4);
+    // 本体
+    ctx.fillStyle = '#FF00FF';
+    ctx.fillRect(bx, by, dotSize, dotSize);
+  }
+
+  // ---- 「MAP」ラベル ----
+  ctx.fillStyle   = 'rgba(255,255,255,0.55)';
+  ctx.font        = '9px monospace';
+  ctx.textBaseline = 'top';
+  ctx.textAlign   = 'left';
+  ctx.fillText('MAP', ox + padding, oy + 1);
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ===== あそびかた画面描画 =====
+function drawHowToPlay(animTimer) {
+  // 背景（タイトルと同じ夜空）
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#050A18');
+  bg.addColorStop(1, '#0A1830');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // ===== タイトル帯 =====
+  ctx.fillStyle = 'rgba(20,40,100,0.7)';
+  ctx.fillRect(0, 10, W, 38);
+  ctx.strokeStyle = 'rgba(100,150,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0, 10, W, 38);
+  ctx.fillStyle = '#FFD700';
+  ctx.font = 'bold 20px monospace';
+  ctx.fillText('📖  あそびかた', W / 2, 29);
+
+  // ===== セクション描画ヘルパー =====
+  const SEC_X   = 32;   // 左端
+  const SEC_W   = W - 64;
+  let   curY    = 66;
+  const LINE_H  = 22;
+
+  function drawSection(icon, title2, lines) {
+    // セクション見出し背景
+    ctx.fillStyle = 'rgba(30,60,130,0.5)';
+    ctx.fillRect(SEC_X - 4, curY - 14, SEC_W + 8, 22);
+    ctx.strokeStyle = 'rgba(80,120,255,0.5)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(SEC_X - 4, curY - 14, SEC_W + 8, 22);
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#88CCFF';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText(icon + '  ' + title2, SEC_X, curY);
+    curY += LINE_H + 2;
+
+    ctx.fillStyle = '#DDDDDD';
+    ctx.font = '13px monospace';
+    for (const line of lines) {
+      ctx.fillText('  ' + line, SEC_X, curY);
+      curY += LINE_H;
+    }
+    curY += 6; // セクション間余白
+  }
+
+  // ===== 【操作方法】 =====
+  drawSection('🎮', '操作方法', [
+    '移動         ↑↓←→ または W/A/S/D キー',
+    'セーブ       S キー（フィールド中）',
+    'BGM ON/OFF   B キー（いつでも）',
+    'メニュー     M キー（装備・アイテム）',
+    '施設に入る   Enter / Space（近くにいる時）',
+    'タイピング   表示された文字をそのままキー入力',
+  ]);
+
+  // ===== 【ゲームの流れ】 =====
+  drawSection('⚔', 'ゲームの流れ', [
+    'フィールドを歩くと敵とエンカウント！',
+    '戦闘はコマンド選択 → タイピングで攻撃',
+    '速くタイプすると「会心の一撃！」(×1.5)',
+    '自分の HP が 0 になるとゲームオーバー',
+    'セーブ済みなら直近のセーブ地点から再開可',
+  ]);
+
+  // ===== 【ヒント】 =====
+  drawSection('💡', 'ヒント', [
+    'インベントリにある装備のみ有効（幽霊装備注意）',
+    '村のショップで装備やアイテムを購入しよう',
+    '宿屋に泊まると HP / MP が全回復する',
+    '強敵と戦う前に S キーでセーブを忘れずに！',
+  ]);
+
+  // ===== 戻るプロンプト（点滅） =====
+  const blinkOn = Math.floor(animTimer / 30) % 2 === 0;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = blinkOn ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.25)';
+  ctx.font = '13px monospace';
+  ctx.fillText('Enter / Space / Esc  でタイトルに戻る', W / 2, H - 18);
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ===== タイトル画面描画 =====
+function drawTitle(animTimer) {
+  const hasSave = hasSaveData();
+
+  // 背景グラデーション（夜空風）
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#050A18');
+  bg.addColorStop(1, '#0A1830');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 星
+  ctx.fillStyle = '#FFFFFF';
+  const stars = [
+    30,20, 80,50, 140,15, 200,40, 280,10, 340,35, 410,18,
+    470,45, 520,22, 580,38, 610,12, 60,70, 180,65, 360,72,
+    500,60, 550,80, 90,90, 250,85, 430,90,
+  ];
+  for (let i = 0; i < stars.length; i += 2) {
+    ctx.globalAlpha = 0.4 + Math.sin(animTimer * 0.04 + i) * 0.3;
+    ctx.fillRect(stars[i], stars[i+1], 1.5, 1.5);
+  }
+  ctx.globalAlpha = 1;
+
+  // タイトルロゴ（影つき）
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.font = 'bold 30px monospace';
+  ctx.fillText('ハイブリッド・タイピングRPG', W/2 + 3, H * 0.28 + 3);
+
+  // 本体（グラデーション）
+  const titleGrad = ctx.createLinearGradient(0, H*0.18, 0, H*0.38);
+  titleGrad.addColorStop(0, '#FFE866');
+  titleGrad.addColorStop(0.5, '#FFD700');
+  titleGrad.addColorStop(1, '#CC9900');
+  ctx.fillStyle = titleGrad;
+  ctx.font = 'bold 30px monospace';
+  ctx.fillText('ハイブリッド・タイピングRPG', W/2, H * 0.28);
+
+  // サブタイトル
+  ctx.fillStyle = '#AACCFF';
+  ctx.font = '14px monospace';
+  ctx.fillText('~ キーボードで冒険しよう ~', W/2, H * 0.38);
+
+  // セパレータ
+  ctx.strokeStyle = 'rgba(100,150,255,0.3)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(W * 0.2, H * 0.44);
+  ctx.lineTo(W * 0.8, H * 0.44);
+  ctx.stroke();
+
+  // メニュー項目
+  // idx は描画上の順番（セーブなし時は「つづきから」をスキップして詰める）
+  const menuItems = [
+    { label: 'はじめから', id: 0, always: true  },
+    { label: 'つづきから', id: 1, always: false },
+    { label: 'あそびかた', id: 2, always: true  },
+  ];
+  // 実際に表示する項目だけ抽出（セーブなし時は「つづきから」を除外）
+  const visibleItems = menuItems.filter(it => it.always || hasSave);
+
+  const menuBaseY = H * 0.52;
+  const menuStep  = 46;
+
+  for (let vi = 0; vi < visibleItems.length; vi++) {
+    const item  = visibleItems[vi];
+    const isSel = title.cursor === vi;
+    const itemY = menuBaseY + vi * menuStep;
+
+    // 選択中は背景ハイライト
+    if (isSel) {
+      const hlW = 260, hlH = 38;
+      const hlX = W/2 - hlW/2;
+      ctx.fillStyle = 'rgba(50,80,160,0.55)';
+      ctx.fillRect(hlX, itemY - hlH/2, hlW, hlH);
+      ctx.strokeStyle = '#5588FF';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(hlX, itemY - hlH/2, hlW, hlH);
+    }
+
+    // カーソル記号（点滅）
+    const showCursor = isSel && Math.floor(animTimer / 20) % 2 === 0;
+    ctx.fillStyle = isSel ? '#FFD700' : '#AAAAAA';
+    ctx.font = (isSel ? 'bold ' : '') + '22px monospace';
+    ctx.fillText((showCursor ? '▶ ' : '  ') + item.label, W/2, itemY);
+  }
+
+  // カーソルを有効範囲内にクランプ
+  if (title.cursor >= visibleItems.length) title.cursor = visibleItems.length - 1;
+
+  // 操作説明
+  const blinkOn = Math.floor(animTimer / 35) % 2 === 0;
+  ctx.fillStyle = blinkOn ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.3)';
+  ctx.font = '14px monospace';
+  ctx.fillText('↑↓ で選択   Enter / Space で決定', W/2, H * 0.86);
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function resetGame() {
+  Object.assign(player,{hp:50,maxHp:50,mp:20,maxMp:20,lv:1,exp:0,atk:10,def:3,
+    coins:0, equip:{weapon:null,armor:null}, inventory:[],
+    learnedAttacks:['kougeki'], learnedMagics:[]});
+  field.stepCount=0; field.px=START_X; field.py=START_Y; field.camX=0; field.camY=0;
+  townMenu.active=false; townMenu.town=null; townMenu.message=''; townMenu.messageTimer=0; townMenu.cursor=0;
+  shop.active=false; shop.message=''; shop.messageTimer=0;
+  fieldMenu.active=false; fieldMenu.message=''; fieldMenu.messageTimer=0;
+  mode='field';
+}
+
+// ===== Web Audio API / SE =====
+// AudioContext はユーザー操作後に初めて生成する（ブラウザの自動再生ポリシー対応）
+let _audioCtx = null;
+
+function getAudioCtx() {
+  if (!_audioCtx) {
+    try {
+      _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) {
+      console.warn('[Audio] Web Audio API が使えません:', e);
+    }
+  }
+  // suspended 状態（モバイルなど）の場合は再開を試みる
+  if (_audioCtx && _audioCtx.state === 'suspended') {
+    _audioCtx.resume();
+  }
+  return _audioCtx;
+}
+
+/**
+ * 汎用オシレーター再生ヘルパー。
+ * @param {object[]} notes  [{freq, startOffset, duration, gain, type}]
+ *   - freq        : 周波数(Hz)
+ *   - startOffset : audioCtx.currentTime からの開始秒
+ *   - duration    : 音符の長さ(秒)
+ *   - gain        : 音量 0.0〜1.0
+ *   - type        : OscillatorType ('sine'|'square'|'triangle'|'sawtooth')
+ */
+function _playNotes(notes) {
+  const ctx2 = getAudioCtx();
+  if (!ctx2) return;
+
+  for (const n of notes) {
+    const osc  = ctx2.createOscillator();
+    const gain = ctx2.createGain();
+
+    osc.connect(gain);
+    gain.connect(ctx2.destination);
+
+    osc.type      = n.type  || 'square';
+    osc.frequency.setValueAtTime(n.freq, ctx2.currentTime + n.startOffset);
+
+    // アタック → サステイン → リリースのエンベロープ
+    const t0      = ctx2.currentTime + n.startOffset;
+    const attack  = 0.005;          // 5ms アタック
+    const release = n.duration * 0.3; // 音符長の30%をリリースに使う
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(n.gain, t0 + attack);
+    gain.gain.setValueAtTime(n.gain, t0 + n.duration - release);
+    gain.gain.linearRampToValueAtTime(0, t0 + n.duration);
+
+    osc.start(t0);
+    osc.stop(t0 + n.duration);
+  }
+}
+
+/**
+ * タイピング1文字入力成功SE：「ピッ」（高め・短い）
+ * 1文字ごとに毎回鳴らすため、音は極めて短くかつ軽い音量にする。
+ */
+function seTypingKey() {
+  _playNotes([
+    { freq: 880, startOffset: 0, duration: 0.045, gain: 0.18, type: 'square' },
+  ]);
+}
+
+/**
+ * タイピング全文字入力完了SE：「ピピッ」（2音・達成感）
+ * finishTyping(true) 時に呼ぶ。
+ */
+function seTypingSuccess() {
+  _playNotes([
+    { freq: 880,  startOffset: 0,    duration: 0.07, gain: 0.25, type: 'square' },
+    { freq: 1320, startOffset: 0.08, duration: 0.10, gain: 0.25, type: 'square' },
+  ]);
+}
+
+/**
+ * タイピング失敗SE：「ブッ」（低音・濁った音）
+ * finishTyping(false) または時間切れ時に呼ぶ。
+ */
+function seTypingFail() {
+  _playNotes([
+    { freq: 160, startOffset: 0,    duration: 0.12, gain: 0.35, type: 'sawtooth' },
+    { freq: 120, startOffset: 0.08, duration: 0.14, gain: 0.30, type: 'sawtooth' },
+  ]);
+}
+
+/**
+ * 敵からダメージを受けたSE：「ドッ」（中低音・鈍い）
+ * enemyAttack() 時に呼ぶ。
+ */
+function seDamageReceived() {
+  _playNotes([
+    { freq: 220, startOffset: 0,    duration: 0.08, gain: 0.40, type: 'sawtooth' },
+    { freq: 180, startOffset: 0.06, duration: 0.15, gain: 0.30, type: 'sawtooth' },
+  ]);
+}
+
+// ===== BGM（Web Audio API オシレーター合成） =====
+// 外部ファイル不要。複数オシレーターをループさせてBGMを生成する。
+//
+// BGMトラック定義：{ bpm, loop: [ {freq, dur, gain, type} ] }
+//   freq=0 は休符。dur は四分音符を1とした長さ。
+//
+const BGM_TRACKS = {
+  // ── タイトル・フィールド BGM（穏やかなファンタジー風） ──
+  field: {
+    bpm: 108,
+    loop: [
+      // ──── A メロ ────
+      {freq:330, dur:1,   gain:0.12, type:'square'},
+      {freq:392, dur:0.5, gain:0.12, type:'square'},
+      {freq:440, dur:0.5, gain:0.12, type:'square'},
+      {freq:494, dur:1,   gain:0.12, type:'square'},
+      {freq:440, dur:1,   gain:0.12, type:'square'},
+      {freq:392, dur:1,   gain:0.12, type:'square'},
+      {freq:330, dur:2,   gain:0.12, type:'square'},
+      // ──── B メロ ────
+      {freq:294, dur:1,   gain:0.11, type:'square'},
+      {freq:330, dur:0.5, gain:0.11, type:'square'},
+      {freq:370, dur:0.5, gain:0.11, type:'square'},
+      {freq:392, dur:1,   gain:0.11, type:'square'},
+      {freq:370, dur:1,   gain:0.11, type:'square'},
+      {freq:330, dur:1,   gain:0.11, type:'square'},
+      {freq:294, dur:2,   gain:0.11, type:'square'},
+      // ──── ベース ライン ────
+      {freq:165, dur:2,   gain:0.07, type:'triangle'},
+      {freq:196, dur:2,   gain:0.07, type:'triangle'},
+      {freq:220, dur:2,   gain:0.07, type:'triangle'},
+      {freq:196, dur:2,   gain:0.07, type:'triangle'},
+    ],
+  },
+
+  // ── 戦闘 BGM（緊迫感のあるリズム） ──
+  battle: {
+    bpm: 148,
+    loop: [
+      {freq:494, dur:0.5, gain:0.13, type:'square'},
+      {freq:523, dur:0.5, gain:0.13, type:'square'},
+      {freq:587, dur:1,   gain:0.13, type:'square'},
+      {freq:523, dur:0.5, gain:0.13, type:'square'},
+      {freq:494, dur:0.5, gain:0.13, type:'square'},
+      {freq:440, dur:1,   gain:0.13, type:'square'},
+      {freq:494, dur:0.5, gain:0.13, type:'square'},
+      {freq:466, dur:0.5, gain:0.13, type:'square'},
+      {freq:440, dur:2,   gain:0.13, type:'square'},
+      // サブライン
+      {freq:247, dur:1,   gain:0.07, type:'triangle'},
+      {freq:262, dur:1,   gain:0.07, type:'triangle'},
+      {freq:294, dur:1,   gain:0.07, type:'triangle'},
+      {freq:247, dur:1,   gain:0.07, type:'triangle'},
+      {freq:220, dur:2,   gain:0.07, type:'triangle'},
+      {freq:0,   dur:2,   gain:0,    type:'triangle'}, // 休符
+    ],
+  },
+
+  // ── 勝利/ゲームオーバー BGM ──
+  victory: {
+    bpm: 130,
+    loop: [
+      {freq:523, dur:0.5, gain:0.14, type:'square'},
+      {freq:659, dur:0.5, gain:0.14, type:'square'},
+      {freq:784, dur:1,   gain:0.14, type:'square'},
+      {freq:659, dur:0.5, gain:0.12, type:'square'},
+      {freq:523, dur:0.5, gain:0.12, type:'square'},
+      {freq:659, dur:2,   gain:0.14, type:'square'},
+      {freq:0,   dur:2,   gain:0,    type:'square'},
+    ],
+  },
+
+  gameover: {
+    bpm: 72,
+    loop: [
+      {freq:262, dur:1,   gain:0.12, type:'sawtooth'},
+      {freq:247, dur:1,   gain:0.12, type:'sawtooth'},
+      {freq:233, dur:1,   gain:0.12, type:'sawtooth'},
+      {freq:220, dur:3,   gain:0.10, type:'sawtooth'},
+      {freq:0,   dur:2,   gain:0,    type:'sawtooth'},
+    ],
+  },
+
+  // ── ゲームクリア BGM（壮大な勝利ファンファーレ風） ──
+  gameclear: {
+    bpm: 100,
+    loop: [
+      {freq:523, dur:0.5, gain:0.14, type:'square'},
+      {freq:659, dur:0.5, gain:0.14, type:'square'},
+      {freq:784, dur:1,   gain:0.16, type:'square'},
+      {freq:880, dur:0.5, gain:0.16, type:'square'},
+      {freq:784, dur:0.5, gain:0.14, type:'square'},
+      {freq:988, dur:2,   gain:0.16, type:'square'},
+      {freq:0,   dur:0.5, gain:0,    type:'square'},
+      {freq:784, dur:0.5, gain:0.12, type:'square'},
+      {freq:880, dur:0.5, gain:0.14, type:'square'},
+      {freq:988, dur:2,   gain:0.16, type:'square'},
+      {freq:0,   dur:1,   gain:0,    type:'square'},
+      // ベースライン
+      {freq:262, dur:1,   gain:0.07, type:'triangle'},
+      {freq:330, dur:1,   gain:0.07, type:'triangle'},
+      {freq:392, dur:1,   gain:0.07, type:'triangle'},
+      {freq:330, dur:1,   gain:0.07, type:'triangle'},
+      {freq:262, dur:2,   gain:0.07, type:'triangle'},
+    ],
+  },
+};
+
+// BGMの内部状態
+const bgm = {
+  current:    null,      // 再生中のトラック名
+  nodes:      [],        // 現在のオシレーター + ゲインノードのリスト
+  loopTimer:  null,      // 次ループのsetTimeout ID
+  enabled:    true,      // BGM ON/OFF フラグ（Bキーでトグル）
+};
+
+/**
+ * BGMを停止する。
+ * 再生中のオシレーターを全て即時停止し、ループタイマーをキャンセルする。
+ */
+function bgmStop() {
+  if (bgm.loopTimer !== null) {
+    clearTimeout(bgm.loopTimer);
+    bgm.loopTimer = null;
+  }
+  for (const { osc, gain } of bgm.nodes) {
+    try {
+      gain.gain.setValueAtTime(0, getAudioCtx()?.currentTime || 0);
+      osc.stop();
+    } catch (_) {}
+  }
+  bgm.nodes    = [];
+  bgm.current  = null;
+}
+
+/**
+ * 指定トラックのBGMを再生する（ループ）。
+ * すでに同じトラックが再生中の場合は何もしない。
+ * @param {string} trackName BGM_TRACKS のキー名
+ */
+function bgmPlay(trackName) {
+  if (!bgm.enabled) return;
+  if (bgm.current === trackName) return; // 同じトラックは継続
+  bgmStop();
+
+  const ctx2 = getAudioCtx();
+  if (!ctx2) return;
+
+  const track = BGM_TRACKS[trackName];
+  if (!track) return;
+
+  bgm.current = trackName;
+
+  const beatSec = 60 / track.bpm; // 四分音符1拍の秒数
+
+  function scheduleLoop() {
+    if (bgm.current !== trackName) return; // 停止済みなら終了
+    const now = ctx2.currentTime;
+    let t = now;
+
+    for (const note of track.loop) {
+      const noteDur = note.dur * beatSec;
+      if (note.freq > 0 && note.gain > 0) {
+        const osc  = ctx2.createOscillator();
+        const gain = ctx2.createGain();
+        osc.connect(gain);
+        gain.connect(ctx2.destination);
+        osc.type = note.type || 'square';
+        osc.frequency.setValueAtTime(note.freq, t);
+        // エンベロープ（短いアタック＋リリース）
+        const attack  = 0.008;
+        const release = Math.min(noteDur * 0.25, 0.06);
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(note.gain, t + attack);
+        gain.gain.setValueAtTime(note.gain, t + noteDur - release);
+        gain.gain.linearRampToValueAtTime(0, t + noteDur);
+        osc.start(t);
+        osc.stop(t + noteDur);
+        bgm.nodes.push({ osc, gain });
+      }
+      t += noteDur;
+    }
+
+    // ループ間隔 = このループの総再生時間
+    const loopDuration = track.loop.reduce((s, n) => s + n.dur * beatSec, 0);
+    // 完了した古いノードを定期的に解放
+    bgm.nodes = bgm.nodes.filter(n => {
+      try { return n.osc.context.state !== 'closed'; } catch (_) { return false; }
+    });
+    bgm.loopTimer = setTimeout(scheduleLoop, (loopDuration - 0.05) * 1000);
+  }
+
+  scheduleLoop();
+}
+
+/** mode に応じたBGMに切り替える */
+function bgmSyncToMode(newMode) {
+  if (!bgm.enabled) return;
+  switch (newMode) {
+    case 'title':
+    case 'howtoplay':
+    case 'field':      bgmPlay('field');     break;
+    case 'flash':
+    case 'battle':     bgmPlay('battle');    break;
+    case 'victory':    bgmPlay('victory');   break;
+    case 'gameover':   bgmPlay('gameover');  break;
+    case 'gameclear':  bgmPlay('gameclear'); break;
+  }
+}
+
+// ===== セーブ・ロード =====
+const SAVE_KEY = 'typingRPG_save_v1';
+
+/**
+ * 現在のゲーム状態を localStorage に保存する。
+ * マップデータ（mapTiles / mapBiome / mapObjects / mapTowns）は
+ * 固定シードで再生成できるため保存しない。
+ * フィールドモードでのみ呼び出す想定（戦闘中は保存不可）。
+ */
+function saveGame() {
+  // 戦闘中・フラッシュ中はセーブ不可
+  if (mode !== 'field') return false;
+
+  const data = {
+    version: 1,
+    savedAt: Date.now(),
+    // --- プレイヤーステータス ---
+    player: {
+      hp:       player.hp,
+      maxHp:    player.maxHp,
+      mp:       player.mp,
+      maxMp:    player.maxMp,
+      lv:       player.lv,
+      exp:      player.exp,
+      atk:      player.atk,
+      def:      player.def,
+      coins:    player.coins,
+      equip:    { weapon: player.equip.weapon, armor: player.equip.armor },
+      inventory: player.inventory.map(s => ({ itemId: s.itemId, qty: s.qty })),
+      learnedAttacks: player.learnedAttacks.slice(),
+      learnedMagics:  player.learnedMagics.slice(),
+    },
+    // --- ボスクリアフラグ ---
+    bossDefeated: BOSS_EVENT.isDefeated,
+    // --- フィールド状態 ---
+    field: {
+      px:          field.px,
+      py:          field.py,
+      stepCount:   field.stepCount,
+      encountSteps:field.encountSteps,
+      facing:      field.facing,
+    },
+    // --- ゲームモード ---
+    mode: 'field', // セーブはフィールド時のみ → 常に 'field' で復元
+  };
+
+  // [DEBUG] 保存直前のデータ内容を出力
+  console.log('[saveGame] 保存データ:', JSON.parse(JSON.stringify(data)));
+
+  try {
+    const json = JSON.stringify(data);
+    localStorage.setItem(SAVE_KEY, json);
+    // [DEBUG] 保存成功 + 実際にストレージに書き込まれた文字列を確認
+    const stored = localStorage.getItem(SAVE_KEY);
+    console.log('[saveGame] 保存成功 ✓  key:', SAVE_KEY);
+    console.log('[saveGame] ストレージ読み返し:', stored ? stored.slice(0, 120) + '…' : '（空）');
+    return true;
+  } catch (e) {
+    // localStorage 容量超過など
+    console.error('[saveGame] 保存に失敗しました:', e);
+    return false;
+  }
+}
+
+/**
+ * localStorage からゲーム状態を復元する。
+ * 成功時は true、データなし・バージョン不一致・解析失敗時は false を返す。
+ * マップはすでに generateMap() で生成済みの前提で呼ぶこと。
+ */
+function loadGame() {
+  const raw = localStorage.getItem(SAVE_KEY);
+  // [DEBUG] getItem の生の結果を確認
+  console.log('[loadGame] localStorage.getItem 結果:',
+    raw === null ? 'null（データなし）' : raw.slice(0, 120) + '…');
+
+  if (!raw) {
+    console.log('[loadGame] セーブデータが存在しないため中断');
+    return false;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+    // [DEBUG] パース後のオブジェクトを確認
+    console.log('[loadGame] JSON.parse 結果:', data);
+  } catch (e) {
+    console.error('[loadGame] JSON.parse 失敗:', e);
+    return false;
+  }
+
+  // バージョンチェック
+  if (!data || data.version !== 1) {
+    console.warn('[loadGame] バージョン不一致のためロードをスキップします。data.version =', data?.version);
+    return false;
+  }
+
+  // --- プレイヤーステータスの復元 ---
+  const p = data.player;
+  Object.assign(player, {
+    hp:        p.hp,
+    maxHp:     p.maxHp,
+    mp:        p.mp,
+    maxMp:     p.maxMp,
+    lv:        p.lv,
+    exp:       p.exp,
+    atk:       p.atk,
+    def:       p.def,
+    coins:     p.coins,
+    equip:     { weapon: p.equip.weapon, armor: p.equip.armor },
+    inventory: (p.inventory || []).map(s => ({ itemId: s.itemId, qty: s.qty })),
+    learnedAttacks: p.learnedAttacks || ['kougeki'],
+    learnedMagics:  p.learnedMagics  || [],
+  });
+
+  // ボスクリアフラグ復元
+  BOSS_EVENT.isDefeated = data.bossDefeated === true;
+
+  // --- フィールド状態の復元 ---
+  const f = data.field;
+  field.px          = (typeof f.px === 'number') ? f.px : START_X;
+  field.py          = (typeof f.py === 'number') ? f.py : START_Y;
+  field.stepCount   = f.stepCount   || 0;
+  field.encountSteps= f.encountSteps|| 20;
+  field.facing      = f.facing      || 'down';
+  field.camX        = 0; // 次フレームで renderField が再計算するため初期化
+  field.camY        = 0;
+  field.moving      = false;
+  field.walkFrame   = 0;
+
+  // --- ロード後は座標がマップ内に収まっているか安全チェック ---
+  field.px = Math.max(0.5, Math.min(MAP_W - 1.5, field.px));
+  field.py = Math.max(0.5, Math.min(MAP_H - 1.5, field.py));
+
+  // --- UI 状態のリセット（メニュー・ショップを閉じる） ---
+  townMenu.active = false; townMenu.town = null;
+  townMenu.message = ''; townMenu.messageTimer = 0; townMenu.cursor = 0;
+  shop.active = false; shop.message = ''; shop.messageTimer = 0;
+  fieldMenu.active = false; fieldMenu.message = ''; fieldMenu.messageTimer = 0;
+
+  mode = 'field';
+  bgmSyncToMode('field');
+  // [DEBUG] 復元後のプレイヤー状態を確認
+  console.log('[loadGame] ロード成功 ✓  復元後 player:', JSON.parse(JSON.stringify(player)));
+  console.log('[loadGame] 復元後 field.px:', field.px, 'field.py:', field.py, 'mode:', mode);
+  return true;
+}
+
+/** セーブデータが存在するか確認するユーティリティ */
+function hasSaveData() {
+  try {
+    const exists = localStorage.getItem(SAVE_KEY) !== null;
+    // [DEBUG] タイトル画面が「つづきから」を表示するかの判定結果を確認
+    console.log('[hasSaveData] key:', SAVE_KEY, '→', exists ? 'あり ✓' : 'なし ✗');
+    return exists;
+  } catch (e) {
+    console.error('[hasSaveData] localStorage アクセスエラー:', e);
+    return false;
+  }
+}
+
+/** セーブデータを削除する（リセット時などに使用） */
+function deleteSaveData() {
+  try {
+    localStorage.removeItem(SAVE_KEY);
+  } catch (e) {
+    console.warn('[deleteSaveData] 削除に失敗しました:', e);
+  }
+}
+
+// ===== タイル描画（トップダウン：正方形タイル） =====
+function drawIsoTile(sx, sy, top, lft, rgt) {
+  // 上面（地面の色）を正方形で塗る
+  ctx.fillStyle = top;
+  ctx.fillRect(sx, sy, TW, TH);
+  // 右側に1pxの影ライン（バイオームの縁取り）
+  ctx.fillStyle = rgt;
+  ctx.fillRect(sx + TW - 2, sy, 2, TH);
+  // 下側に1pxの影ライン
+  ctx.fillStyle = lft;
+  ctx.fillRect(sx, sy + TH - 2, TW, 2);
+}
+
+function drawWaterTile(sx, sy, t) {
+  const wave = Math.sin(t * 0.003 + sx * 0.05) * 1.5;
+  // ベース
+  ctx.fillStyle = '#3A8AAA';
+  ctx.fillRect(sx, sy, TW, TH);
+  // 光の揺らぎ
+  ctx.fillStyle = `rgba(180,230,255,${0.15 + Math.abs(wave) * 0.06})`;
+  ctx.fillRect(sx + 4, sy + 4 + wave, TW - 8, TH / 3);
+}
+
+function drawLavaTile(sx, sy, t) {
+  const g = ctx.createLinearGradient(sx, sy, sx + TW, sy + TH);
+  const flicker = 0.5 + Math.sin(t * 0.004 + sx * 0.05) * 0.3;
+  g.addColorStop(0, `rgba(${Math.floor(200 + flicker*55)},30,0,1)`);
+  g.addColorStop(1, `rgba(${Math.floor(160 + flicker*40)},10,0,1)`);
+  ctx.fillStyle = g;
+  ctx.fillRect(sx, sy, TW, TH);
+  // 気泡
+  if (Math.sin(t * 0.004 + sx * 0.1) > 0.92) {
+    ctx.fillStyle = 'rgba(255,200,0,0.7)';
+    ctx.beginPath();
+    ctx.arc(sx + TW / 2 + Math.sin(t * 0.01) * 8, sy + TH / 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ===== フィールドオブジェクト描画 =====
+function drawIsoObject(sx,sy,type) {
+  switch(type) {
+    case 'tree':         drawTree(sx,sy,'#5C3317','#7A4422',['#1A5E2A','#226B32','#2E8040']); break;
+    case 'bigrock':      drawRock(sx,sy,'#777','#555','#666',1.3); break;
+    case 'rock':         drawRock(sx,sy,'#888','#666','#777',1.0); break;
+    case 'cactus':       drawCactus(sx,sy); break;
+    case 'snowtree':     drawTree(sx,sy,'#8899AA','#9AAABB',['#DDEEFF','#C8E0F8','#AACCEE']); break;
+    case 'icerock':      drawRock(sx,sy,'#99CCEE','#7799AA','#88BBDD',1.1); break;
+    case 'lavarock':     drawRock(sx,sy,'#442211','#221108','#331810',1.2); break;
+    case 'deadtree':     drawDeadTree(sx,sy); break;
+    case 'palmtree':     drawPalmTree(sx,sy); break;
+    case 'demon_castle': drawDemonCastle(sx,sy); break;
+  }
+}
+
+function drawTree(sx,sy,trunkL,trunkR,leafCols) {
+  const hw=TW/2;
+  ctx.fillStyle=trunkL; ctx.fillRect(sx-4,sy-18,4,18);
+  ctx.fillStyle=trunkR; ctx.fillRect(sx,sy-18,4,18);
+  for (let i=0;i<3;i++) {
+    const ly=sy-20-i*12, lhw=hw*(0.7-i*0.15), lhh=TH*(0.6-i*0.1);
+    ctx.fillStyle=leafCols[i];
+    ctx.beginPath(); ctx.moveTo(sx,ly-lhh); ctx.lineTo(sx+lhw,ly);
+    ctx.lineTo(sx,ly+lhh); ctx.lineTo(sx-lhw,ly); ctx.closePath(); ctx.fill();
+  }
+}
+
+function drawRock(sx,sy,top,lft,rgt,scale=1.0) {
+  const hw=TW*0.35*scale, hh=TH*0.5*scale;
+  ctx.fillStyle=top;
+  ctx.beginPath(); ctx.moveTo(sx,sy-hh-6*scale); ctx.lineTo(sx+hw,sy-3*scale);
+  ctx.lineTo(sx,sy+hh-4*scale); ctx.lineTo(sx-hw,sy-3*scale); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=lft;
+  ctx.beginPath(); ctx.moveTo(sx-hw,sy-3*scale); ctx.lineTo(sx,sy+hh-4*scale);
+  ctx.lineTo(sx,sy+hh); ctx.lineTo(sx-hw,sy+scale); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=rgt;
+  ctx.beginPath(); ctx.moveTo(sx+hw,sy-3*scale); ctx.lineTo(sx,sy+hh-4*scale);
+  ctx.lineTo(sx,sy+hh); ctx.lineTo(sx+hw,sy+scale); ctx.closePath(); ctx.fill();
+}
+
+function drawCactus(sx,sy) {
+  ctx.fillStyle='#2A7A2A';
+  ctx.fillRect(sx-3,sy-28,6,28); // 幹
+  ctx.fillRect(sx-10,sy-22,7,5); // 左腕
+  ctx.fillRect(sx-10,sy-28,5,9);
+  ctx.fillRect(sx+3,sy-20,7,5);  // 右腕
+  ctx.fillRect(sx+5,sy-28,5,9);
+  ctx.fillStyle='#3A9A3A';
+  ctx.fillRect(sx-2,sy-30,4,5);  // 先端
+}
+
+function drawDeadTree(sx,sy) {
+  ctx.fillStyle='#5A4030';
+  ctx.fillRect(sx-3,sy-24,6,24);
+  ctx.fillStyle='#4A3020';
+  ctx.fillRect(sx-3,sy-24,3,24);
+  // 枯れ枝
+  ctx.strokeStyle='#5A4030'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(sx,sy-20); ctx.lineTo(sx-12,sy-28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx,sy-16); ctx.lineTo(sx+10,sy-23); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sx,sy-12); ctx.lineTo(sx-8,sy-18); ctx.stroke();
+}
+
+function drawPalmTree(sx,sy) {
+  // 曲がった幹
+  ctx.fillStyle='#8B6914';
+  for (let i=0;i<5;i++) {
+    ctx.fillRect(sx-2+i*0.5,sy-i*6,4,6);
+  }
+  // ヤシの葉（放射状）
+  ctx.strokeStyle='#2A8A1A'; ctx.lineWidth=3;
+  const tx=sx+2, ty=sy-28;
+  for (let a=0;a<6;a++) {
+    const ang=-Math.PI/2+(a-2.5)*0.5;
+    ctx.beginPath(); ctx.moveTo(tx,ty);
+    ctx.lineTo(tx+Math.cos(ang)*18, ty+Math.sin(ang)*8); ctx.stroke();
+  }
+}
+
+// ===== 魔王城（Demon King Castle）描画 =====
+// アイソメトリックで通常建物の4倍サイズ。禍々しい黒×紫のシルエット。
+// sx,sy はタイルの画面中心座標。
+function drawDemonCastle(sx, sy) {
+  const now = Date.now();
+
+  // ---- 影（地面投影） ----
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(sx, sy + 6, 52, 18, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ---- 基壇（土台ブロック：アイソメ台形） ----
+  ctx.fillStyle = '#1A0A1A'; // 黒紫
+  ctx.beginPath();
+  ctx.moveTo(sx,      sy - 10);
+  ctx.lineTo(sx + 48, sy + 14);
+  ctx.lineTo(sx,      sy + 38);
+  ctx.lineTo(sx - 48, sy + 14);
+  ctx.closePath();
+  ctx.fill();
+  // 基壇・左面
+  ctx.fillStyle = '#0E0510';
+  ctx.beginPath();
+  ctx.moveTo(sx - 48, sy + 14);
+  ctx.lineTo(sx,      sy + 38);
+  ctx.lineTo(sx,      sy + 50);
+  ctx.lineTo(sx - 48, sy + 26);
+  ctx.closePath();
+  ctx.fill();
+  // 基壇・右面
+  ctx.fillStyle = '#160818';
+  ctx.beginPath();
+  ctx.moveTo(sx + 48, sy + 14);
+  ctx.lineTo(sx,      sy + 38);
+  ctx.lineTo(sx,      sy + 50);
+  ctx.lineTo(sx + 48, sy + 26);
+  ctx.closePath();
+  ctx.fill();
+
+  // ---- 本城壁（中央の大きな四角い建物） ----
+  const wallTop = sy - 56;
+  // 壁・左面
+  ctx.fillStyle = '#1E0A22';
+  ctx.beginPath();
+  ctx.moveTo(sx - 28, sy + 10);
+  ctx.lineTo(sx,      sy - 6);
+  ctx.lineTo(sx,      wallTop);
+  ctx.lineTo(sx - 28, wallTop + 16);
+  ctx.closePath();
+  ctx.fill();
+  // 壁・右面
+  ctx.fillStyle = '#2A0C30';
+  ctx.beginPath();
+  ctx.moveTo(sx + 28, sy + 10);
+  ctx.lineTo(sx,      sy - 6);
+  ctx.lineTo(sx,      wallTop);
+  ctx.lineTo(sx + 28, wallTop + 16);
+  ctx.closePath();
+  ctx.fill();
+  // 壁・天面
+  ctx.fillStyle = '#3A1040';
+  ctx.beginPath();
+  ctx.moveTo(sx,       wallTop);
+  ctx.lineTo(sx - 28,  wallTop + 16);
+  ctx.lineTo(sx,       wallTop + 32);
+  ctx.lineTo(sx + 28,  wallTop + 16);
+  ctx.closePath();
+  ctx.fill();
+
+  // ---- 中央の大塔（高い四角い尖塔） ----
+  const towerH = 68;
+  const towerTop = wallTop - towerH;
+  // 塔・左面
+  ctx.fillStyle = '#220830';
+  ctx.beginPath();
+  ctx.moveTo(sx - 12, wallTop + 8);
+  ctx.lineTo(sx,      wallTop);
+  ctx.lineTo(sx,      towerTop);
+  ctx.lineTo(sx - 12, towerTop + 8);
+  ctx.closePath();
+  ctx.fill();
+  // 塔・右面
+  ctx.fillStyle = '#300A3E';
+  ctx.beginPath();
+  ctx.moveTo(sx + 12, wallTop + 8);
+  ctx.lineTo(sx,      wallTop);
+  ctx.lineTo(sx,      towerTop);
+  ctx.lineTo(sx + 12, towerTop + 8);
+  ctx.closePath();
+  ctx.fill();
+  // 塔・天面
+  ctx.fillStyle = '#4A1258';
+  ctx.beginPath();
+  ctx.moveTo(sx,      towerTop);
+  ctx.lineTo(sx - 12, towerTop + 8);
+  ctx.lineTo(sx,      towerTop + 16);
+  ctx.lineTo(sx + 12, towerTop + 8);
+  ctx.closePath();
+  ctx.fill();
+
+  // ---- 尖塔の先端（とがった屋根）----
+  // 左面
+  ctx.fillStyle = '#5A0A6A';
+  ctx.beginPath();
+  ctx.moveTo(sx - 12, towerTop + 8);
+  ctx.lineTo(sx,      towerTop - 20);
+  ctx.lineTo(sx,      towerTop + 16);
+  ctx.closePath();
+  ctx.fill();
+  // 右面
+  ctx.fillStyle = '#6E0C80';
+  ctx.beginPath();
+  ctx.moveTo(sx + 12, towerTop + 8);
+  ctx.lineTo(sx,      towerTop - 20);
+  ctx.lineTo(sx,      towerTop + 16);
+  ctx.closePath();
+  ctx.fill();
+
+  // ---- 左右の小塔 ----
+  function drawMinorTower(ox, oy) {
+    const mTop = oy - 32;
+    ctx.fillStyle = '#1E0828';
+    ctx.beginPath();
+    ctx.moveTo(ox - 6, oy + 4);
+    ctx.lineTo(ox,     oy);
+    ctx.lineTo(ox,     mTop);
+    ctx.lineTo(ox - 6, mTop + 4);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#2A0C38';
+    ctx.beginPath();
+    ctx.moveTo(ox + 6, oy + 4);
+    ctx.lineTo(ox,     oy);
+    ctx.lineTo(ox,     mTop);
+    ctx.lineTo(ox + 6, mTop + 4);
+    ctx.closePath();
+    ctx.fill();
+    // 小塔の屋根（三角）
+    ctx.fillStyle = '#440880';
+    ctx.beginPath();
+    ctx.moveTo(ox - 6, mTop + 4);
+    ctx.lineTo(ox,     mTop - 12);
+    ctx.lineTo(ox + 6, mTop + 4);
+    ctx.closePath();
+    ctx.fill();
+  }
+  drawMinorTower(sx - 26, wallTop + 14);
+  drawMinorTower(sx + 26, wallTop + 14);
+
+  // ---- 城門（中央下部） ----
+  ctx.fillStyle = '#0A0010';
+  // アーチ型
+  ctx.beginPath();
+  ctx.arc(sx, sy - 4, 7, Math.PI, 0, false);
+  ctx.lineTo(sx + 7, sy + 6);
+  ctx.lineTo(sx - 7, sy + 6);
+  ctx.closePath();
+  ctx.fill();
+
+  // ---- 窓（青紫の輝き） ----
+  const glowAlpha = 0.5 + Math.sin(now * 0.002) * 0.3; // 脈動
+  ctx.fillStyle = `rgba(140,0,200,${glowAlpha})`;
+  // 左塔の窓
+  ctx.beginPath(); ctx.ellipse(sx - 24, wallTop + 6, 3, 4, 0, 0, Math.PI * 2); ctx.fill();
+  // 右塔の窓
+  ctx.beginPath(); ctx.ellipse(sx + 24, wallTop + 6, 3, 4, 0, 0, Math.PI * 2); ctx.fill();
+  // 大塔の窓（2つ）
+  ctx.beginPath(); ctx.ellipse(sx - 4, wallTop - 20, 2.5, 4, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(sx + 4, wallTop - 20, 2.5, 4, 0, 0, Math.PI * 2); ctx.fill();
+
+  // ---- 尖塔頂上のオーラ（揺れる紫炎） ----
+  const flameY = towerTop - 22;
+  for (let i = 0; i < 3; i++) {
+    const flicker = Math.sin(now * 0.004 + i * 2.1) * 3;
+    const fa = 0.4 + Math.sin(now * 0.005 + i) * 0.2;
+    ctx.fillStyle = `rgba(180,0,255,${fa})`;
+    ctx.beginPath();
+    ctx.ellipse(sx + flicker, flameY - i * 4, 4 - i, 5 + i, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ===== 村の家（アイソメトリック3D） =====
+function drawVillage(sx, sy, name) {
+  // 家（メイン）
+  // 壁・左面
+  ctx.fillStyle='#D4A870';
+  ctx.beginPath();
+  ctx.moveTo(sx-20, sy-10);
+  ctx.lineTo(sx,    sy+0);
+  ctx.lineTo(sx,    sy+20);
+  ctx.lineTo(sx-20, sy+10);
+  ctx.closePath(); ctx.fill();
+  // 壁・右面
+  ctx.fillStyle='#C49060';
+  ctx.beginPath();
+  ctx.moveTo(sx,    sy+0);
+  ctx.lineTo(sx+20, sy-10);
+  ctx.lineTo(sx+20, sy+10);
+  ctx.lineTo(sx,    sy+20);
+  ctx.closePath(); ctx.fill();
+  // 屋根（左）
+  ctx.fillStyle='#CC4422';
+  ctx.beginPath();
+  ctx.moveTo(sx-20, sy-10);
+  ctx.lineTo(sx,    sy-22);
+  ctx.lineTo(sx,    sy+0);
+  ctx.closePath(); ctx.fill();
+  // 屋根（右）
+  ctx.fillStyle='#AA3318';
+  ctx.beginPath();
+  ctx.moveTo(sx+20, sy-10);
+  ctx.lineTo(sx,    sy-22);
+  ctx.lineTo(sx,    sy+0);
+  ctx.closePath(); ctx.fill();
+  // 屋根（天面）
+  ctx.fillStyle='#EE5533';
+  ctx.beginPath();
+  ctx.moveTo(sx,    sy-22);
+  ctx.lineTo(sx-20, sy-10);
+  ctx.lineTo(sx,    sy-2);
+  ctx.lineTo(sx+20, sy-10);
+  ctx.closePath(); ctx.fill();
+  // 扉
+  ctx.fillStyle='#7A4A20';
+  ctx.fillRect(sx-4, sy+6, 8, 14);
+  // 窓（左面）
+  ctx.fillStyle='#AADDFF';
+  ctx.fillRect(sx-15, sy-4, 6, 6);
+  // 旗（緑）
+  ctx.fillStyle='#228833';
+  ctx.fillRect(sx-1, sy-30, 2, 10);
+  ctx.beginPath();
+  ctx.moveTo(sx+1, sy-30); ctx.lineTo(sx+8, sy-26); ctx.lineTo(sx+1, sy-22);
+  ctx.closePath(); ctx.fill();
+
+  // 名前ラベル
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillRect(sx - ctx.measureText(name).width/2 - 4, sy+20, ctx.measureText(name).width+8, 14);
+  ctx.fillStyle='#FFEE88'; ctx.font='17px monospace'; ctx.textAlign='center';
+  ctx.fillText(name, sx, sy+30); ctx.textAlign='left';
+}
+
+// ===== 宿屋（アイソメトリック3D） =====
+function drawInn(sx, sy, name) {
+  // 壁・左面（大きめ）
+  ctx.fillStyle='#C8B490';
+  ctx.beginPath();
+  ctx.moveTo(sx-24, sy-8);
+  ctx.lineTo(sx,    sy+4);
+  ctx.lineTo(sx,    sy+26);
+  ctx.lineTo(sx-24, sy+14);
+  ctx.closePath(); ctx.fill();
+  // 壁・右面
+  ctx.fillStyle='#B09A78';
+  ctx.beginPath();
+  ctx.moveTo(sx,    sy+4);
+  ctx.lineTo(sx+24, sy-8);
+  ctx.lineTo(sx+24, sy+14);
+  ctx.lineTo(sx,    sy+26);
+  ctx.closePath(); ctx.fill();
+  // 屋根（左）
+  ctx.fillStyle='#4466AA';
+  ctx.beginPath();
+  ctx.moveTo(sx-24, sy-8);
+  ctx.lineTo(sx,    sy-26);
+  ctx.lineTo(sx,    sy+4);
+  ctx.closePath(); ctx.fill();
+  // 屋根（右）
+  ctx.fillStyle='#335599';
+  ctx.beginPath();
+  ctx.moveTo(sx+24, sy-8);
+  ctx.lineTo(sx,    sy-26);
+  ctx.lineTo(sx,    sy+4);
+  ctx.closePath(); ctx.fill();
+  // 屋根（天面）
+  ctx.fillStyle='#5588CC';
+  ctx.beginPath();
+  ctx.moveTo(sx,    sy-26);
+  ctx.lineTo(sx-24, sy-8);
+  ctx.lineTo(sx,    sy-4);
+  ctx.lineTo(sx+24, sy-8);
+  ctx.closePath(); ctx.fill();
+  // 扉
+  ctx.fillStyle='#5A3A18';
+  ctx.fillRect(sx-5, sy+8, 10, 18);
+  // 窓×2
+  ctx.fillStyle='#FFEEAA';
+  ctx.fillRect(sx-18, sy-2, 7, 8);
+  ctx.fillRect(sx+11, sy-2, 7, 8);
+  // 看板
+  ctx.fillStyle='#8B6220';
+  ctx.fillRect(sx-10, sy-16, 20, 8);
+  ctx.fillStyle='#FFF8D0'; ctx.font='16px monospace'; ctx.textAlign='center';
+  ctx.fillText('INN', sx, sy-10); ctx.textAlign='left';
+  // 旗（青）
+  ctx.fillStyle='#2244AA';
+  ctx.fillRect(sx-1, sy-34, 2, 10);
+  ctx.beginPath();
+  ctx.moveTo(sx+1, sy-34); ctx.lineTo(sx+9, sy-30); ctx.lineTo(sx+1, sy-26);
+  ctx.closePath(); ctx.fill();
+
+  // 名前ラベル
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillRect(sx - ctx.measureText(name).width/2 - 4, sy+26, ctx.measureText(name).width+8, 14);
+  ctx.fillStyle='#AADDFF'; ctx.font='17px monospace'; ctx.textAlign='center';
+  ctx.fillText(name, sx, sy+36); ctx.textAlign='left';
+}
+
+// ===== バイオーム別の空・地平線 =====
+const BIOME_SKY = [
+  // 0 平原
+  {sky0:'#1A3A6A',sky1:'#3A6A9A',hor:'#1B4D3E',base:'#2A5C3A'},
+  // 1 森
+  {sky0:'#0A2A1A',sky1:'#1A5A2A',hor:'#0A3A10',base:'#1A4A20'},
+  // 2 砂漠
+  {sky0:'#8A5A00',sky1:'#D4A020',hor:'#B87820',base:'#C4A040'},
+  // 3 雪原
+  {sky0:'#8899CC',sky1:'#BBCCEE',hor:'#AABBDD',base:'#D0E0F0'},
+  // 4 火山
+  {sky0:'#220000',sky1:'#660A00',hor:'#3A1000',base:'#1A0808'},
+  // 5 湿地
+  {sky0:'#1A2A10',sky1:'#2A4A18',hor:'#1A3A10',base:'#283820'},
+  // 6 海岸
+  {sky0:'#1A4A8A',sky1:'#3A80C0',hor:'#1A6A9A',base:'#4A90C0'},
+];
+
+function drawFieldSky(biome) {
+  const s = BIOME_SKY[biome] || BIOME_SKY[0];
+  const g = ctx.createLinearGradient(0,0,0,H*0.38);
+  g.addColorStop(0,s.sky0); g.addColorStop(1,s.sky1);
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H*0.38);
+
+  // 星（雪原・夜っぽいバイオームのみ）
+  if (biome===BIOME.SNOW||biome===BIOME.VOLCANO||biome===BIOME.SWAMP||biome===BIOME.PLAIN) {
+    ctx.fillStyle='#FFFFFF';
+    const stars=[30,8,90,18,150,5,220,22,290,10,360,20,430,7,60,30,180,28,310,32,400,25,470,15];
+    for (let i=0;i<stars.length;i+=2) {
+      ctx.globalAlpha=0.5+Math.sin(Date.now()*0.001+i)*0.3;
+      ctx.fillRect(stars[i],stars[i+1],1.5,1.5);
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // 火山：飛び散る火の粉
+  if (biome===BIOME.VOLCANO) {
+    ctx.fillStyle='#FF6600';
+    const t=Date.now()*0.001;
+    for (let i=0;i<8;i++) {
+      const px2=((Math.sin(t*0.7+i*1.3)*0.5+0.5)*W)|0;
+      const py2=(H*0.2+Math.sin(t*1.1+i)*H*0.1)|0;
+      ctx.globalAlpha=0.4+Math.sin(t+i)*0.3;
+      ctx.beginPath(); ctx.arc(px2,py2,2,0,Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha=1;
+  }
+
+  // 地平線の山
+  ctx.fillStyle=s.hor;
+  ctx.beginPath(); ctx.moveTo(0,H*0.38);
+  const peaks=[[0,0.30],[W*0.11,0.20],[W*0.22,0.30],[W*0.33,0.16],[W*0.44,0.26],[W*0.55,0.18],[W*0.66,0.28],[W*0.75,0.22]];
+  peaks.forEach(([px2,py2])=>ctx.lineTo(px2,H*py2));
+  ctx.lineTo(W,H*0.38); ctx.closePath(); ctx.fill();
+
+  // 地面ベース色
+  ctx.fillStyle=s.base; ctx.fillRect(0,H*0.38,W,H);
+}
+
+// ===== アイソメトリックフィールド描画 =====
+function drawIsoField(camX,camY,walkFrame,facing) {
+  const biome=getCurrentBiome();
+  drawFieldSky(biome);
+
+  const clipY=H-120;
+  ctx.save(); ctx.beginPath(); ctx.rect(0,0,W,clipY); ctx.clip();
+
+  const now=Date.now();
+
+  for (let ty=0;ty<MAP_H;ty++) {
+    for (let tx=0;tx<MAP_W;tx++) {
+      const {sx,sy}=isoToScreen(tx,ty,camX,camY);
+      if (sx<-TW||sx>W+TW||sy<-TH||sy>clipY+TH) continue;
+      const tid=mapTiles[ty][tx];
+      if (tid===70) { drawWaterTile(sx,sy,now); continue; }
+      if (tid===71) { drawLavaTile(sx,sy,now); continue; }
+      const def=TILE_DEF[tid];
+      if (def) drawIsoTile(sx,sy,def.top,def.lft,def.rgt);
+    }
+  }
+
+  // オブジェクト＋プレイヤー奥行きソート（Yが大きい＝手前）
+  const playerDepth=field.py;
+  const visObjs=mapObjects.filter(o=>{
+    const {sx,sy}=isoToScreen(o.tx,o.ty,camX,camY);
+    return sx>-TW*2&&sx<W+TW*2&&sy>-80&&sy<clipY+80;
+  }).sort((a,b)=>a.ty-b.ty);
+
+  // 村・宿も同じ奥行きリストに混ぜて描画
+  const visTowns=mapTowns.filter(t=>{
+    const {sx,sy}=isoToScreen(t.tx,t.ty,camX,camY);
+    return sx>-TW*3&&sx<W+TW*3&&sy>-100&&sy<clipY+100;
+  });
+  const allObjs=[...visObjs, ...visTowns].sort((a,b)=>a.ty-b.ty);
+
+  let playerDrawn=false;
+  for (const obj of allObjs) {
+    if (!playerDrawn && obj.ty>=playerDepth) {
+      const {sx:px2,sy:py2}=isoToScreen(field.px,field.py,camX,camY);
+      drawIsoPlayer(px2+TW/2,py2+TH/2,walkFrame,facing);
+      playerDrawn=true;
+    }
+    const {sx,sy}=isoToScreen(obj.tx,obj.ty,camX,camY);
+    if (obj.type==='village') drawVillage(sx+TW/2,sy+TH/2,obj.name);
+    else if (obj.type==='inn') drawInn(sx+TW/2,sy+TH/2,obj.name);
+    else drawIsoObject(sx+TW/2,sy+TH/2,obj.type);
+  }
+  if (!playerDrawn) {
+    const {sx:px2,sy:py2}=isoToScreen(field.px,field.py,camX,camY);
+    drawIsoPlayer(px2+TW/2,py2+TH/2,walkFrame,facing);
+  }
+
+  ctx.restore();
+}
+
+// ===== プレイヤー描画（トップダウン視点）=====
+function drawIsoPlayer(sx, sy, walkFrame, facing) {
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.22)';
+  ctx.beginPath(); ctx.ellipse(sx, sy+4, 9, 5, 0, 0, Math.PI*2); ctx.fill();
+
+  // 足（歩行アニメ）
+  ctx.fillStyle = '#5C3317';
+  if (facing === 'down' || facing === 'up') {
+    const legOff = walkFrame===0 ? 0 : 2;
+    ctx.fillRect(sx-6, sy+4+legOff,  5, 6);
+    ctx.fillRect(sx+1, sy+4-legOff,  5, 6);
+  } else {
+    const legOff = walkFrame===0 ? 0 : 2;
+    ctx.fillRect(sx-4, sy+3+legOff,  4, 6);
+    ctx.fillRect(sx+0, sy+3-legOff,  4, 6);
+  }
+
+  // 胴体（青いマント）
+  ctx.fillStyle = '#2266CC';
+  ctx.beginPath(); ctx.ellipse(sx, sy-2, 9, 11, 0, 0, Math.PI*2); ctx.fill();
+
+  // マント縁（赤）
+  ctx.strokeStyle = '#CC4400'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(sx, sy-2, 9, 11, 0, 0, Math.PI*2); ctx.stroke();
+
+  // 頭
+  ctx.fillStyle = '#F4C07A';
+  ctx.beginPath(); ctx.ellipse(sx, sy-12, 7, 7, 0, 0, Math.PI*2); ctx.fill();
+
+  // 髪
+  ctx.fillStyle = '#3A2010';
+  ctx.beginPath(); ctx.ellipse(sx, sy-15, 7, 5, 0, Math.PI, Math.PI*2); ctx.fill();
+
+  // 目（向きに応じて位置変更）
+  ctx.fillStyle = '#000';
+  if (facing === 'down') {
+    ctx.fillRect(sx-3, sy-12, 2, 2);
+    ctx.fillRect(sx+1, sy-12, 2, 2);
+  } else if (facing === 'up') {
+    // 後ろ向き：目なし
+  } else if (facing === 'left') {
+    ctx.fillRect(sx-4, sy-13, 2, 2);
+  } else {
+    ctx.fillRect(sx+2, sy-13, 2, 2);
+  }
+}
+
+// ===== 敵描画（全モンスター対応） =====
+function drawEnemy(e) {
+  const now = Date.now();
+  // ===== キャラクタースケール（1.5倍・サイズアップ） =====
+  const SCALE = 1.5;
+
+  // ===== 待機アニメーション =====
+  // 浮遊：2秒周期で上下±7px（1.5倍スケールに合わせ増幅）
+  const floatY  = Math.sin(now * 0.003) * 7;
+  // 脈動（幅±2.5%、高±2%）
+  const pulseX  = 1 + Math.sin(now * 0.0025) * 0.025;
+  const pulseY  = 1 + Math.cos(now * 0.0025) * 0.02;
+
+  // ===== シェイク（1.5倍スケールに合わせて振れ幅も増幅） =====
+  const shakeX  = calcShake(battle.enemyShake, 12);
+  if (battle.enemyShake > 0) battle.enemyShake--;
+
+  // 描画基準点（アニメ込み・スケールアップ分調整）
+  const cx = W/2 + 40 + shakeX;
+  const cy = H * 0.15 + floatY;
+
+  ctx.save();
+  // 脈動スケール × 全体 1.5 倍スケール（キャラクタ中心を基準に）
+  ctx.translate(cx, cy + 40);
+  ctx.scale(pulseX * SCALE, pulseY * SCALE);
+  ctx.translate(-cx, -(cy + 40));
+
+  switch (e.shape || 'slime') {
+    case 'slime':      drawEnemySlime(cx, cy, e.color, now);      break;
+    case 'wolf':       drawEnemyWolf(cx, cy, e.color, now);       break;
+    case 'dragon':     drawEnemyDragon(cx, cy, e.color, now);     break;
+    case 'ghost':      drawEnemyGhost(cx, cy, e.color, now);      break;
+    case 'goblin':     drawEnemyGoblin(cx, cy, e.color, now);     break;
+    case 'golem':      drawEnemyGolem(cx, cy, e.color, now);      break;
+    case 'worm':       drawEnemyWorm(cx, cy, e.color, now);       break;
+    case 'scorpion':   drawEnemyScorpion(cx, cy, e.color, now);   break;
+    case 'mummy':      drawEnemyMummy(cx, cy, e.color, now);      break;
+    case 'dryad':      drawEnemyDryad(cx, cy, e.color, now);      break;
+    case 'salamander': drawEnemySalamander(cx, cy, e.color, now); break;
+    case 'wisp':       drawEnemyWisp(cx, cy, e.color, now);       break;
+    case 'kraken':     drawEnemyKraken(cx, cy, e.color, now);     break;
+    case 'demon_king': drawEnemyDemonKing(cx, cy, now);           break;
+    default:           drawEnemySlime(cx, cy, e.color, now);      break;
+  }
+
+  // ===== 被弾フラッシュ（赤半透明オーバーレイ） =====
+  if (battle.enemyHitFlash > 0) {
+    battle.enemyHitFlash--;
+    ctx.globalAlpha = battle.enemyHitFlash / 8 * 0.55;
+    ctx.fillStyle = '#FF2200';
+    ctx.fillRect(cx - 60, cy - 10, 120, 100);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+// ===== グラデーション生成ヘルパー =====
+function radGrad(cx, cy, r0, r1, c0, c1) {
+  const g = ctx.createRadialGradient(cx, cy, r0, cx, cy, r1);
+  g.addColorStop(0, c0); g.addColorStop(1, c1); return g;
+}
+function linGrad(x0, y0, x1, y1, stops) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  stops.forEach(([t, c]) => g.addColorStop(t, c)); return g;
+}
+
+function drawEnemySlime(cx, cy, col, now) {
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 72, 26, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+  // ボディ（放射グラデーション：中心は明るい）
+  const sg = radGrad(cx - 8, cy + 22, 4, 32, '#FFFFFF40', col);
+  ctx.fillStyle = sg;
+  ctx.beginPath();
+  ctx.arc(cx, cy + 30, 30, Math.PI, 0, false);
+  ctx.quadraticCurveTo(cx + 32, cy + 72, cx, cy + 68);
+  ctx.quadraticCurveTo(cx - 32, cy + 72, cx - 30, cy + 30);
+  ctx.fill();
+
+  // ハイライト
+  ctx.fillStyle = 'rgba(255,255,255,0.32)';
+  ctx.beginPath(); ctx.ellipse(cx - 10, cy + 22, 10, 7, -0.5, 0, Math.PI * 2); ctx.fill();
+
+  // 目（白目→黒目→ハイライト）
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(cx - 10, cy + 25, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 10, cy + 25, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = col;
+  const eyeShift = Math.sin(now * 0.002) * 1.5; // 目がわずかに動く
+  ctx.beginPath(); ctx.arc(cx - 8 + eyeShift, cy + 27, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 12 + eyeShift, cy + 27, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(cx - 6 + eyeShift, cy + 25, 1.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 14 + eyeShift, cy + 25, 1.5, 0, Math.PI * 2); ctx.fill();
+
+  // 触角
+  ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  const wa = Math.sin(now * 0.004) * 4;
+  ctx.beginPath(); ctx.moveTo(cx - 5, cy); ctx.lineTo(cx - 8 - wa, cy - 16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + 5, cy); ctx.lineTo(cx + 8 + wa, cy - 16); ctx.stroke();
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.arc(cx - 8 - wa, cy - 16, 3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 8 + wa, cy - 16, 3, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyWolf(cx, cy, col, now) {
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 78, 28, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+  const tailWag = Math.sin(now * 0.005) * 18;
+  ctx.strokeStyle = col; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - 26, cy + 38);
+  ctx.quadraticCurveTo(cx - 48 + tailWag * 0.5, cy + 24, cx - 38 + tailWag, cy + 14);
+  ctx.stroke();
+
+  // 胴
+  const bodyG = radGrad(cx - 5, cy + 35, 5, 30, _lighten(col, 0.4), col);
+  ctx.fillStyle = bodyG;
+  ctx.beginPath(); ctx.ellipse(cx, cy + 40, 28, 18, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 頭
+  ctx.fillStyle = linGrad(cx + 5, cy + 10, cx + 35, cy + 35,
+    [[0, _lighten(col, 0.3)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx + 20, cy + 22, 18, 14, 0.3, 0, Math.PI * 2); ctx.fill();
+
+  // 耳
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.moveTo(cx + 18, cy + 10); ctx.lineTo(cx + 10, cy - 2); ctx.lineTo(cx + 28, cy + 8); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 30, cy + 12); ctx.lineTo(cx + 26, cy); ctx.lineTo(cx + 38, cy + 10); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(255,160,160,0.5)'; // 耳の内側
+  ctx.beginPath(); ctx.moveTo(cx + 18, cy + 9); ctx.lineTo(cx + 12, cy + 0); ctx.lineTo(cx + 25, cy + 8); ctx.closePath(); ctx.fill();
+
+  // 目
+  ctx.fillStyle = '#FF8800';
+  ctx.beginPath(); ctx.arc(cx + 24, cy + 20, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx + 25, cy + 20, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(cx + 24, cy + 18.5, 1, 0, Math.PI * 2); ctx.fill();
+
+  // 鼻
+  ctx.fillStyle = '#222';
+  ctx.beginPath(); ctx.ellipse(cx + 35, cy + 26, 4, 3, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 脚
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 20, cy + 55, 8, 20); ctx.fillRect(cx - 6, cy + 55, 8, 20);
+  ctx.fillRect(cx + 8,  cy + 55, 8, 20); ctx.fillRect(cx + 20, cy + 55, 8, 20);
+  // 爪
+  ctx.fillStyle = '#DDCCAA';
+  for (let i = 0; i < 4; i++) {
+    const lx = [cx - 22, cx - 8, cx + 6, cx + 18];
+    ctx.fillRect(lx[i], cy + 74, 3, 4); ctx.fillRect(lx[i] + 4, cy + 74, 3, 4);
+  }
+}
+
+function drawEnemyDragon(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 72, 30, 7, 0, 0, Math.PI * 2); ctx.fill();
+
+  const wFlap = Math.sin(now * 0.004) * 8;
+  // 翼
+  const wingCol = _darken(col, 0.3);
+  ctx.fillStyle = wingCol;
+  ctx.beginPath(); ctx.moveTo(cx - 28, cy + 25); ctx.lineTo(cx - 55 - wFlap, cy + 5); ctx.lineTo(cx - 52 - wFlap, cy + 55); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 28, cy + 25); ctx.lineTo(cx + 55 + wFlap, cy + 5); ctx.lineTo(cx + 52 + wFlap, cy + 55); ctx.closePath(); ctx.fill();
+  // 翼の膜
+  ctx.fillStyle = `${col}88`;
+  ctx.beginPath(); ctx.moveTo(cx - 28, cy + 25); ctx.lineTo(cx - 55 - wFlap, cy + 5); ctx.lineTo(cx - 15, cy + 12); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 28, cy + 25); ctx.lineTo(cx + 55 + wFlap, cy + 5); ctx.lineTo(cx + 15, cy + 12); ctx.closePath(); ctx.fill();
+
+  // 胴
+  ctx.fillStyle = linGrad(cx, cy, cx, cy + 65, [[0, _lighten(col, 0.25)], [1, _darken(col, 0.2)]]);
+  ctx.beginPath(); ctx.moveTo(cx, cy + 5); ctx.lineTo(cx - 28, cy + 65); ctx.lineTo(cx + 28, cy + 65); ctx.closePath(); ctx.fill();
+  // 頭
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 18, cy - 15, 36, 28);
+  // うろこ模様
+  ctx.fillStyle = _darken(col, 0.2);
+  for (let i = 0; i < 3; i++) ctx.fillRect(cx - 14 + i * 10, cy - 8, 7, 6);
+
+  // 目（黄色・光る）
+  ctx.fillStyle = '#FFEE00';
+  ctx.beginPath(); ctx.arc(cx - 8, cy - 4, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 8, cy - 4, 5, 0, Math.PI * 2); ctx.fill();
+  const glowA = 0.4 + Math.sin(now * 0.003) * 0.2;
+  ctx.fillStyle = `rgba(255,220,0,${glowA})`;
+  ctx.beginPath(); ctx.arc(cx - 8, cy - 4, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 8, cy - 4, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 7, cy - 4, 3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 9, cy - 4, 3, 0, Math.PI * 2); ctx.fill();
+
+  // 火炎（口から）
+  const fA = Math.abs(Math.sin(now * 0.005)) * 0.8;
+  if (fA > 0.2) {
+    ctx.fillStyle = `rgba(255,150,0,${fA * 0.7})`;
+    ctx.beginPath(); ctx.ellipse(cx + 24, cy - 8, 14 * fA, 6 * fA, 0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,100,${fA * 0.5})`;
+    ctx.beginPath(); ctx.ellipse(cx + 22, cy - 8, 8 * fA, 3 * fA, 0.3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawEnemyGhost(cx, cy, col, now) {
+  const t = now * 0.002;
+  const drift = Math.sin(t) * 4;
+
+  ctx.globalAlpha = 0.82 + Math.sin(t * 1.3) * 0.08;
+  // 外側グロー
+  ctx.fillStyle = radGrad(cx + drift, cy + 25, 5, 35, col + 'AA', col + '00');
+  ctx.beginPath(); ctx.arc(cx + drift, cy + 20, 35, 0, Math.PI * 2); ctx.fill();
+
+  // 本体
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(cx + drift, cy + 20, 28, Math.PI, 0, false);
+  ctx.lineTo(cx + drift + 28, cy + 72);
+  for (let i = 5; i >= 0; i--) {
+    ctx.lineTo(cx + drift + 28 - (5 - i) * 9.3, cy + 62 + (i % 2 === 0 ? 10 : 0));
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // 目（深紫）
+  ctx.fillStyle = '#220044';
+  ctx.beginPath(); ctx.arc(cx - 10 + drift, cy + 15, 6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 10 + drift, cy + 15, 6, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#AAAAFF';
+  ctx.beginPath(); ctx.arc(cx - 9 + drift, cy + 14, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 11 + drift, cy + 14, 2.5, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyGoblin(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 62, 18, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 脚
+  ctx.fillStyle = _darken(col, 0.15);
+  ctx.fillRect(cx - 9, cy + 42, 8, 20); ctx.fillRect(cx + 1, cy + 42, 8, 20);
+
+  // 胴
+  ctx.fillStyle = linGrad(cx, cy + 22, cx, cy + 44, [[0, _lighten(col, 0.2)], [1, col]]);
+  ctx.fillRect(cx - 10, cy + 22, 20, 22);
+
+  // 腕（ぷらぷら揺れる）
+  const armSwing = Math.sin(now * 0.003) * 5;
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 20, cy + 24 + armSwing * 0.5, 8, 16);
+  ctx.fillRect(cx + 12, cy + 24 - armSwing * 0.5, 8, 16);
+
+  // 頭
+  ctx.fillStyle = linGrad(cx, cy, cx, cy + 26, [[0, _lighten(col, 0.3)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 12, 14, 12, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 耳（大きい）
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.ellipse(cx - 16, cy + 10, 7, 5, 0.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx + 16, cy + 10, 7, 5, -0.5, 0, Math.PI * 2); ctx.fill();
+
+  // 目（赤く光る）
+  const eyeGlow = 0.7 + Math.sin(now * 0.004) * 0.3;
+  ctx.fillStyle = `rgba(255,30,0,${eyeGlow})`;
+  ctx.beginPath(); ctx.arc(cx - 5, cy + 10, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 5, cy + 10, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 4, cy + 10, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 6, cy + 10, 2.5, 0, Math.PI * 2); ctx.fill();
+
+  // 牙
+  ctx.fillStyle = '#FFFFCC';
+  ctx.beginPath(); ctx.moveTo(cx - 3, cy + 18); ctx.lineTo(cx - 1, cy + 22); ctx.lineTo(cx + 1, cy + 18); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 2, cy + 18); ctx.lineTo(cx + 4, cy + 22); ctx.lineTo(cx + 6, cy + 18); ctx.fill();
+}
+
+function drawEnemyGolem(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 82, 30, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 脚
+  ctx.fillStyle = linGrad(cx, cy + 58, cx, cy + 78, [[0, col], [1, _darken(col, 0.3)]]);
+  ctx.fillRect(cx - 14, cy + 58, 12, 22); ctx.fillRect(cx + 2, cy + 58, 12, 22);
+
+  // 胴
+  const bodyG = linGrad(cx - 22, cy + 10, cx + 22, cy + 10, [[0, _darken(col, 0.2)], [0.5, _lighten(col, 0.15)], [1, _darken(col, 0.2)]]);
+  ctx.fillStyle = bodyG;
+  ctx.fillRect(cx - 22, cy + 10, 44, 50);
+
+  // 腕
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 28, cy + 14, 8, 32); ctx.fillRect(cx + 20, cy + 14, 8, 32);
+
+  // 頭
+  ctx.fillStyle = linGrad(cx, cy - 8, cx, cy + 18, [[0, _lighten(col, 0.2)], [1, col]]);
+  ctx.fillRect(cx - 16, cy - 8, 32, 24);
+
+  // 目（白い光）
+  const eyePulse = 0.6 + Math.sin(now * 0.004) * 0.4;
+  ctx.fillStyle = `rgba(255,255,255,${eyePulse})`;
+  ctx.fillRect(cx - 10, cy, 8, 8); ctx.fillRect(cx + 2, cy, 8, 8);
+
+  // 亀裂
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cx - 5, cy + 15); ctx.lineTo(cx + 3, cy + 40); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + 8, cy + 20); ctx.lineTo(cx + 2, cy + 45); ctx.stroke();
+
+  // 地面の岩粒（足元の粒子）
+  ctx.fillStyle = col;
+  for (let i = 0; i < 3; i++) {
+    const px2 = cx - 20 + i * 18 + Math.sin(now * 0.002 + i) * 3;
+    ctx.beginPath(); ctx.arc(px2, cy + 80, 2, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawEnemyWorm(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 68, 16, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+  const segs = [
+    {x: cx,      y: cy + 55},
+    {x: cx - 8,  y: cy + 42},
+    {x: cx - 4,  y: cy + 30},
+    {x: cx + 4,  y: cy + 20},
+    {x: cx,      y: cy + 10},
+  ];
+  // セグメント（後ろから）
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const r = 14 - i * 1.5;
+    const t2 = now * 0.003 + i * 0.5;
+    const jx = Math.sin(t2) * 2;
+    const segG = radGrad(segs[i].x + jx - r * 0.3, segs[i].y - r * 0.3, 1, r, _lighten(col, 0.4), col);
+    ctx.fillStyle = segG;
+    ctx.globalAlpha = 0.9;
+    ctx.beginPath(); ctx.ellipse(segs[i].x + jx, segs[i].y, r, r * 0.8, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 頭
+  ctx.fillStyle = radGrad(cx - 5, cy + 4, 3, 18, _lighten(col, 0.35), col);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 8, 18, 14, 0, 0, Math.PI * 2); ctx.fill();
+  // 目
+  ctx.fillStyle = '#FFEE00';
+  ctx.beginPath(); ctx.arc(cx - 6, cy + 6, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 6, cy + 6, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 5, cy + 6, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 7, cy + 6, 2.5, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyScorpion(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 62, 24, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+  // しっぽ（アニメ）
+  const sting = Math.sin(now * 0.003) * 8;
+  ctx.strokeStyle = col; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx, cy + 55); ctx.quadraticCurveTo(cx + 30, cy + 65 + sting, cx + 20, cy + 30 - sting); ctx.stroke();
+  ctx.fillStyle = '#FF4400';
+  ctx.beginPath(); ctx.arc(cx + 18, cy + 28 - sting, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FF8800';
+  ctx.beginPath(); ctx.arc(cx + 18, cy + 28 - sting, 3, 0, Math.PI * 2); ctx.fill();
+
+  // 胴
+  ctx.fillStyle = linGrad(cx, cy + 38, cx, cy + 62, [[0, _lighten(col, 0.2)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 45, 22, 14, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 頭
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.ellipse(cx, cy + 22, 16, 12, 0, 0, Math.PI * 2); ctx.fill();
+
+  // ハサミ
+  ctx.fillStyle = _darken(col, 0.15);
+  ctx.fillRect(cx - 34, cy + 18, 14, 9); ctx.fillRect(cx - 40, cy + 14, 9, 7);
+  ctx.fillRect(cx + 20, cy + 18, 14, 9); ctx.fillRect(cx + 31, cy + 14, 9, 7);
+
+  // 脚（3対）
+  ctx.strokeStyle = col; ctx.lineWidth = 2.5;
+  for (let i = 0; i < 3; i++) {
+    const legSway = Math.sin(now * 0.004 + i) * 3;
+    ctx.beginPath(); ctx.moveTo(cx - 18, cy + 38 + i * 6); ctx.lineTo(cx - 32, cy + 30 + i * 5 + legSway); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 18, cy + 38 + i * 6); ctx.lineTo(cx + 32, cy + 30 + i * 5 - legSway); ctx.stroke();
+  }
+
+  // 目（赤）
+  ctx.fillStyle = '#FF0000';
+  ctx.beginPath(); ctx.arc(cx - 5, cy + 18, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 5, cy + 18, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 4, cy + 18, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 6, cy + 18, 2, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyMummy(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 74, 18, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 脚
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 11, cy + 53, 10, 22); ctx.fillRect(cx + 1, cy + 53, 10, 22);
+
+  // 胴
+  ctx.fillStyle = linGrad(cx, cy + 15, cx, cy + 55, [[0, _lighten(col, 0.15)], [1, _darken(col, 0.1)]]);
+  ctx.fillRect(cx - 12, cy + 15, 24, 40);
+
+  // 腕（左右に前に伸ばすポーズ）
+  const armSway = Math.sin(now * 0.002) * 3;
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 20, cy + 18 + armSway, 9, 30);
+  ctx.fillRect(cx + 11, cy + 18 - armSway, 9, 30);
+
+  // 頭
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 10, cy - 5, 20, 26);
+
+  // 包帯ライン
+  ctx.strokeStyle = 'rgba(255,255,220,0.55)'; ctx.lineWidth = 2;
+  for (let i = 0; i < 5; i++) {
+    ctx.beginPath(); ctx.moveTo(cx - 12, cy + 18 + i * 7); ctx.lineTo(cx + 12, cy + 18 + i * 7); ctx.stroke();
+  }
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(cx - 10, cy - 2 + i * 7); ctx.lineTo(cx + 10, cy - 2 + i * 7); ctx.stroke();
+  }
+
+  // 目（金色の光）
+  const eyeG = 0.7 + Math.sin(now * 0.003) * 0.3;
+  ctx.fillStyle = `rgba(255,200,0,${eyeG})`;
+  ctx.beginPath(); ctx.arc(cx - 3, cy + 4, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 5, cy + 4, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 2, cy + 4, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 6, cy + 4, 2.5, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyDryad(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 66, 18, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 木の腕（揺れる枝）
+  const sway = Math.sin(now * 0.002) * 6;
+  ctx.strokeStyle = col; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx - 14, cy + 32); ctx.quadraticCurveTo(cx - 30 - sway, cy + 22, cx - 24 - sway, cy + 8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + 14, cy + 32); ctx.quadraticCurveTo(cx + 30 + sway, cy + 22, cx + 24 + sway, cy + 8); ctx.stroke();
+  // 枝先の葉
+  ctx.fillStyle = '#2A8A1A';
+  ctx.beginPath(); ctx.arc(cx - 25 - sway, cy + 7, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 25 + sway, cy + 7, 8, 0, Math.PI * 2); ctx.fill();
+
+  // 胴
+  ctx.fillStyle = radGrad(cx - 4, cy + 28, 4, 22, _lighten(col, 0.3), col);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 38, 16, 24, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 葉の冠（頭周り）
+  for (let a = 0; a < 6; a++) {
+    const ang = a * Math.PI * 2 / 6 - Math.PI / 2;
+    const leafSwing = Math.sin(now * 0.002 + a) * 0.2;
+    ctx.fillStyle = a % 2 === 0 ? '#2A8A1A' : '#3AAA28';
+    ctx.beginPath();
+    ctx.ellipse(
+      cx + Math.cos(ang + leafSwing) * 20,
+      cy - 4 + Math.sin(ang + leafSwing) * 10,
+      9, 5, ang + leafSwing, 0, Math.PI * 2
+    );
+    ctx.fill();
+  }
+
+  // 頭
+  ctx.fillStyle = linGrad(cx, cy, cx, cy + 28, [[0, _lighten(col, 0.35)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 12, 14, 13, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 目（葉緑色）
+  ctx.fillStyle = '#88FF44';
+  ctx.beginPath(); ctx.arc(cx - 4, cy + 8, 4.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 4, cy + 8, 4.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 3, cy + 8, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 5, cy + 8, 2, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemySalamander(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 76, 28, 6, 0, 0, Math.PI * 2); ctx.fill();
+
+  // しっぽ
+  const tailWave = Math.sin(now * 0.003) * 8;
+  ctx.strokeStyle = col; ctx.lineWidth = 8; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx - 24, cy + 44); ctx.quadraticCurveTo(cx - 44 + tailWave, cy + 55, cx - 38 + tailWave, cy + 35); ctx.stroke();
+
+  // 胴
+  ctx.fillStyle = linGrad(cx, cy + 30, cx, cy + 60, [[0, _lighten(col, 0.2)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 42, 26, 16, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 背中の炎（脈動）
+  for (let i = 0; i < 4; i++) {
+    const fh = (8 + Math.sin(now * 0.005 + i) * 4);
+    const fg = ctx.createLinearGradient(cx - 12 + i * 8, cy + 28 - fh, cx - 12 + i * 8, cy + 30);
+    fg.addColorStop(0, 'rgba(255,200,0,0)');
+    fg.addColorStop(1, '#FF8800');
+    ctx.fillStyle = fg;
+    ctx.beginPath(); ctx.ellipse(cx - 12 + i * 8, cy + 29, 4, fh, 0, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // 脚
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - 18, cy + 55, 8, 16); ctx.fillRect(cx - 4, cy + 55, 8, 16);
+  ctx.fillRect(cx + 6,  cy + 55, 8, 16); ctx.fillRect(cx + 16, cy + 55, 8, 16);
+
+  // 頭
+  ctx.fillStyle = linGrad(cx + 8, cy + 20, cx + 38, cy + 38, [[0, _lighten(col, 0.25)], [1, col]]);
+  ctx.beginPath(); ctx.ellipse(cx + 22, cy + 28, 16, 11, 0.4, 0, Math.PI * 2); ctx.fill();
+
+  // 目
+  ctx.fillStyle = '#FFFF00';
+  ctx.beginPath(); ctx.arc(cx + 28, cy + 26, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx + 29, cy + 26, 2.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(cx + 28, cy + 25, 1, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawEnemyWisp(cx, cy, col, now) {
+  const t = now * 0.003;
+  const wx = cx + Math.sin(t) * 8;
+  const wy = cy + 30 + Math.cos(t * 0.9) * 6;
+
+  // 外側グロー（3層）
+  for (let r2 = 3; r2 >= 1; r2--) {
+    ctx.fillStyle = col;
+    ctx.globalAlpha = 0.12 * r2;
+    ctx.beginPath(); ctx.arc(wx, wy, 24 * r2 / 3, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // コア（白→コア色グラデーション）
+  ctx.fillStyle = radGrad(wx - 4, wy - 4, 2, 12, '#FFFFFF', col);
+  ctx.beginPath(); ctx.arc(wx, wy, 12, 0, Math.PI * 2); ctx.fill();
+
+  // 中心の白点
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(wx, wy, 5, 0, Math.PI * 2); ctx.fill();
+
+  // 軌跡パーティクル
+  for (let i = 1; i <= 5; i++) {
+    const ang = t - i * 0.5;
+    const tx2 = cx + Math.sin(ang) * 8 * 1.3;
+    const ty2 = cy + 30 + Math.cos(ang * 0.9) * 6 * 1.3;
+    ctx.fillStyle = col;
+    ctx.globalAlpha = 0.4 / i;
+    ctx.beginPath(); ctx.arc(tx2, ty2, Math.max(1, 5 - i * 0.8), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawEnemyKraken(cx, cy, col, now) {
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 86, 35, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 触手（後ろ側 3本）
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 3; i++) {
+    const ang = -Math.PI / 2 + (i - 1) * 0.7;
+    const wave = Math.sin(now * 0.003 + i * 1.2) * 10;
+    const tkG = ctx.createLinearGradient(cx, cy + 55, cx + Math.cos(ang) * 60, cy + 55 + Math.sin(ang) * 60);
+    tkG.addColorStop(0, col); tkG.addColorStop(1, _darken(col, 0.3));
+    ctx.strokeStyle = tkG; ctx.lineWidth = 12;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 55);
+    ctx.quadraticCurveTo(cx + Math.cos(ang) * 35, cy + 55 + wave, cx + Math.cos(ang) * 60, cy + 55 + Math.sin(ang) * 55);
+    ctx.stroke();
+  }
+
+  // 頭（胴）
+  ctx.fillStyle = radGrad(cx - 10, cy + 20, 8, 35, _lighten(col, 0.3), col);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 30, 32, 28, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 前触手（3本、頭の前）
+  for (let i = 0; i < 3; i++) {
+    const ang = -Math.PI / 2 + (i - 1) * 0.6 + 0.1;
+    const wave = Math.sin(now * 0.003 + i * 1.5 + 1) * 8;
+    ctx.strokeStyle = col; ctx.lineWidth = 8;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(ang) * 28, cy + 40);
+    ctx.quadraticCurveTo(cx + Math.cos(ang) * 45, cy + 40 + wave, cx + Math.cos(ang) * 60, cy + 50 + Math.sin(ang) * 40);
+    ctx.stroke();
+  }
+
+  // 目（大きい・オレンジ）
+  ctx.fillStyle = '#FF8800';
+  ctx.beginPath(); ctx.arc(cx - 12, cy + 24, 11, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 12, cy + 24, 11, 0, Math.PI * 2); ctx.fill();
+  const pupilShift = Math.sin(now * 0.002) * 2;
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx - 11 + pupilShift, cy + 24, 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 13 + pupilShift, cy + 24, 5.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(cx - 9 + pupilShift, cy + 22, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 15 + pupilShift, cy + 22, 2, 0, Math.PI * 2); ctx.fill();
+}
+
+// 魔王（ボス専用の描画）
+function drawEnemyDemonKing(cx, cy, now) {
+  ctx.fillStyle = 'rgba(80,0,20,0.3)';
+  ctx.beginPath(); ctx.ellipse(cx, cy + 82, 40, 10, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 背後オーラ
+  const auraA = 0.15 + Math.sin(now * 0.002) * 0.08;
+  ctx.fillStyle = `rgba(160,0,80,${auraA})`;
+  ctx.beginPath(); ctx.arc(cx, cy + 30, 70, 0, Math.PI * 2); ctx.fill();
+
+  // マント（後ろ）
+  ctx.fillStyle = '#1A0020';
+  ctx.beginPath();
+  ctx.moveTo(cx - 32, cy + 15);
+  ctx.quadraticCurveTo(cx - 45, cy + 60, cx - 20, cy + 85);
+  ctx.lineTo(cx + 20, cy + 85);
+  ctx.quadraticCurveTo(cx + 45, cy + 60, cx + 32, cy + 15);
+  ctx.closePath(); ctx.fill();
+  // マントの縁（紫）
+  ctx.strokeStyle = '#6600AA'; ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // 胴体
+  ctx.fillStyle = linGrad(cx, cy + 20, cx, cy + 65, [[0, '#2A0030'], [0.5, '#3A0044'], [1, '#1A0020']]);
+  ctx.fillRect(cx - 18, cy + 20, 36, 45);
+  // 鎧の文様
+  ctx.strokeStyle = '#8800AA'; ctx.lineWidth = 1.5;
+  ctx.strokeRect(cx - 14, cy + 25, 28, 35);
+  ctx.beginPath(); ctx.moveTo(cx, cy + 25); ctx.lineTo(cx, cy + 60); ctx.stroke();
+
+  // 腕
+  ctx.fillStyle = '#2A0030';
+  ctx.fillRect(cx - 30, cy + 22, 12, 36); ctx.fillRect(cx + 18, cy + 22, 12, 36);
+  // 手（爪）
+  ctx.fillStyle = '#3A0040';
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(cx - 30 + i * 4, cy + 58); ctx.lineTo(cx - 32 + i * 4, cy + 66); ctx.lineTo(cx - 26 + i * 4, cy + 58); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx + 18 + i * 4, cy + 58); ctx.lineTo(cx + 16 + i * 4, cy + 66); ctx.lineTo(cx + 22 + i * 4, cy + 58); ctx.fill();
+  }
+
+  // 脚
+  ctx.fillStyle = '#1A0020';
+  ctx.fillRect(cx - 14, cy + 63, 11, 22); ctx.fillRect(cx + 3, cy + 63, 11, 22);
+
+  // 首
+  ctx.fillStyle = '#2A0030';
+  ctx.fillRect(cx - 6, cy + 12, 12, 10);
+
+  // 頭
+  ctx.fillStyle = linGrad(cx, cy - 10, cx, cy + 18, [[0, '#3A0044'], [1, '#1E0028']]);
+  ctx.beginPath(); ctx.ellipse(cx, cy + 4, 18, 16, 0, 0, Math.PI * 2); ctx.fill();
+
+  // 角（左右）
+  ctx.fillStyle = '#550066';
+  ctx.beginPath(); ctx.moveTo(cx - 14, cy - 8); ctx.lineTo(cx - 20, cy - 30); ctx.lineTo(cx - 6, cy - 12); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 14, cy - 8); ctx.lineTo(cx + 20, cy - 30); ctx.lineTo(cx + 6, cy - 12); ctx.closePath(); ctx.fill();
+  // 角の輝き
+  ctx.strokeStyle = '#AA00FF'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(cx - 14, cy - 8); ctx.lineTo(cx - 20, cy - 30); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx + 14, cy - 8); ctx.lineTo(cx + 20, cy - 30); ctx.stroke();
+
+  // 目（赤く輝く）
+  const eyeGlow = 0.7 + Math.sin(now * 0.005) * 0.3;
+  ctx.fillStyle = `rgba(255,0,40,${eyeGlow})`;
+  ctx.beginPath(); ctx.arc(cx - 7, cy + 2, 6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 7, cy + 2, 6, 0, Math.PI * 2); ctx.fill();
+  // 外側グロー
+  ctx.fillStyle = `rgba(255,0,80,${eyeGlow * 0.3})`;
+  ctx.beginPath(); ctx.arc(cx - 7, cy + 2, 10, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 7, cy + 2, 10, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(cx - 5, cy + 0.5, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 9, cy + 0.5, 2, 0, Math.PI * 2); ctx.fill();
+
+  // 口（裂けた笑み）
+  ctx.strokeStyle = '#FF0030'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy + 9, 8, 0.15, Math.PI - 0.15, false); ctx.stroke();
+  // 牙
+  ctx.fillStyle = '#FFFFEE';
+  ctx.beginPath(); ctx.moveTo(cx - 5, cy + 10); ctx.lineTo(cx - 3, cy + 16); ctx.lineTo(cx - 1, cy + 10); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx + 1, cy + 10); ctx.lineTo(cx + 3, cy + 16); ctx.lineTo(cx + 5, cy + 10); ctx.fill();
+
+  // 魔法陣（足元、回転）
+  const rot = (now * 0.001) % (Math.PI * 2);
+  ctx.save();
+  ctx.translate(cx, cy + 74);
+  ctx.rotate(rot);
+  ctx.strokeStyle = `rgba(150,0,255,${0.25 + Math.sin(now * 0.003) * 0.1})`;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(0, 0, 38, 0, Math.PI * 2); ctx.stroke();
+  for (let i = 0; i < 6; i++) {
+    const a = i * Math.PI / 3;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * 38, Math.sin(a) * 38); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ===== 色操作ヘルパー（hex → 明るく/暗く） =====
+function _lighten(hex, amt) {
+  // hex='#RRGGBB' を amt(0〜1) 分明るくして返す
+  const n = parseInt(hex.replace('#',''), 16);
+  const r = Math.min(255, (n >> 16) + Math.round(255 * amt));
+  const g = Math.min(255, ((n >> 8) & 0xff) + Math.round(255 * amt));
+  const b = Math.min(255, (n & 0xff) + Math.round(255 * amt));
+  return `rgb(${r},${g},${b})`;
+}
+function _darken(hex, amt) {
+  const n = parseInt(hex.replace('#',''), 16);
+  const r = Math.max(0, (n >> 16) - Math.round(255 * amt));
+  const g = Math.max(0, ((n >> 8) & 0xff) - Math.round(255 * amt));
+  const b = Math.max(0, (n & 0xff) - Math.round(255 * amt));
+  return `rgb(${r},${g},${b})`;
+}
+// hex文字列のまま返すバリアント（createLinearGradient の addColorStop 用）
+function _darkenHex(hex, amt) {
+  const n = parseInt(hex.replace('#',''), 16);
+  const r = Math.max(0, (n >> 16) - Math.round(255 * amt)).toString(16).padStart(2,'0');
+  const g = Math.max(0, ((n >> 8) & 0xff) - Math.round(255 * amt)).toString(16).padStart(2,'0');
+  const b = Math.max(0, (n & 0xff) - Math.round(255 * amt)).toString(16).padStart(2,'0');
+  return `#${r}${g}${b}`;
+}
+
+// ===== 施設システム =====
+// プレイヤーの現在位置に近い村・宿を返す
+// 半径 2.8 タイル以内 → エンカウントブロック・Enter判定・プロンプト表示の全てに使用
+const TOWN_SAFE_RADIUS = 2.8;
+
+function getNearbyTown() {
+  for (const t of mapTowns) {
+    if (Math.hypot(field.px - t.tx, field.py - t.ty) < TOWN_SAFE_RADIUS) return t;
+  }
+  return null;
+}
+
+// 施設メニューの選択肢（村＝回復＋ショップ、宿屋＝回復のみ）
+function getTownOptions(town) {
+  if (town.type === 'village') {
+    return [
+      { label: 'みせ  (武器/防具/アイテム)',  action: 'shop'  },
+      { label: 'やすむ  (HP/MP 少し回復)',    action: 'rest'  },
+      { label: 'さる',                         action: 'leave' },
+    ];
+  } else {
+    return [
+      { label: 'とまる  (HP/MP 全回復)',      action: 'sleep' },
+      { label: 'やすむ  (HP/MP 少し回復)',    action: 'rest'  },
+      { label: 'さる',                         action: 'leave' },
+    ];
+  }
+}
+
+// ショップ状態は上部で定義済み
+
+function getShopList() {
+  const stock = SHOP_STOCK[shop.biome] || SHOP_STOCK[BIOME.PLAIN];
+  if (shop.tab === 0) return stock.weapons.map(k=>({...WEAPON_MASTER[k], id:k, mtype:'weapon'}));
+  if (shop.tab === 1) return stock.armors .map(k=>({...ARMOR_MASTER [k], id:k, mtype:'armor' }));
+  return stock.items.map(k=>({...ITEM_MASTER[k], id:k, mtype:'item'}));
+}
+
+// フィールドメニュー状態（Mキーで開く）
+
+function handleFieldMenuInput(key) {
+  if (fieldMenu.messageTimer > 0) return;
+  if (key === 'Escape' || key === 'x' || key === 'X' || key === 'm' || key === 'M') {
+    fieldMenu.active = false; return;
+  }
+  if (key === 'ArrowLeft')  { fieldMenu.tab = (fieldMenu.tab + 1) % 2; fieldMenu.cursor = 0; return; }
+  if (key === 'ArrowRight') { fieldMenu.tab = (fieldMenu.tab + 1) % 2; fieldMenu.cursor = 0; return; }
+
+  if (fieldMenu.tab === 0) {
+    // 装備タブ：武器・防具リスト
+    const equipList = buildEquipList();
+    if (key === 'ArrowUp')   fieldMenu.cursor = (fieldMenu.cursor - 1 + equipList.length) % equipList.length;
+    if (key === 'ArrowDown') fieldMenu.cursor = (fieldMenu.cursor + 1) % equipList.length;
+    if (key === 'Enter' || key === ' ') {
+      const e = equipList[fieldMenu.cursor];
+      if (!e) return;
+      if (e.slot === 'weapon') { player.equip.weapon = player.equip.weapon===e.id ? null : e.id; fieldMenu.message = e.id ? e.name+'を そうび！' : '武器をはずした'; }
+      else                     { player.equip.armor  = player.equip.armor ===e.id ? null : e.id; fieldMenu.message = e.id ? e.name+'を そうび！' : '防具をはずした'; }
+      fieldMenu.messageTimer = 80;
+    }
+  } else {
+    // アイテムタブ
+    const inv = player.inventory;
+    if (key === 'ArrowUp')   fieldMenu.cursor = (fieldMenu.cursor - 1 + Math.max(1,inv.length)) % Math.max(1,inv.length);
+    if (key === 'ArrowDown') fieldMenu.cursor = (fieldMenu.cursor + 1) % Math.max(1,inv.length);
+    if ((key === 'Enter' || key === ' ') && inv.length > 0) {
+      const slot = inv[fieldMenu.cursor];
+      if (!slot) return;
+      const result = useItem(slot.itemId);
+      fieldMenu.message = result || 'つかえなかった';
+      fieldMenu.messageTimer = 90;
+      fieldMenu.cursor = Math.min(fieldMenu.cursor, Math.max(0, player.inventory.length-1));
+    }
+  }
+}
+
+// 所持武器・防具リストを返す（装備可能なもの）
+function buildEquipList() {
+  const list = [];
+
+  // インベントリに実際に存在するIDのセットを先に作る
+  const ownedIds = new Set(player.inventory.map(s => s.itemId));
+
+  // 武器：インベントリに存在するものだけ列挙
+  for (const id of Object.keys(WEAPON_MASTER)) {
+    if (!ownedIds.has(id)) continue;
+    list.push({ ...WEAPON_MASTER[id], id, slot:'weapon', equipped: player.equip.weapon === id });
+  }
+
+  // 防具：インベントリに存在するものだけ列挙
+  for (const id of Object.keys(ARMOR_MASTER)) {
+    if (!ownedIds.has(id)) continue;
+    list.push({ ...ARMOR_MASTER[id], id, slot:'armor', equipped: player.equip.armor === id });
+  }
+
+  // 装備スロットに入っているがインベントリに存在しない異常ケースを修正
+  // （equip だけ残ってしまっている場合はスロットをクリアして整合性を保つ）
+  if (player.equip.weapon && !ownedIds.has(player.equip.weapon)) {
+    player.equip.weapon = null;
+  }
+  if (player.equip.armor && !ownedIds.has(player.equip.armor)) {
+    player.equip.armor = null;
+  }
+
+  if (list.length === 0) list.push({ name:'（なし）', id:null, slot:'weapon', equipped:false, desc:'', atkBonus:0, defBonus:0 });
+  return list;
+}
+
+function useTownOption(town, action) {
+  if (action === 'shop') {
+    shop.active=true; shop.tab=0; shop.cursor=0;
+    shop.message=''; shop.messageTimer=0;
+    shop.biome = town.biome;
+    return;
+  }
+  if (action === 'rest') {
+    const hpHeal = Math.floor(player.maxHp * 0.3);
+    const mpHeal = Math.floor(player.maxMp * 0.3);
+    player.hp = Math.min(player.maxHp, player.hp + hpHeal);
+    player.mp = Math.min(player.maxMp, player.mp + mpHeal);
+    townMenu.message = 'HP+'+hpHeal+' MP+'+mpHeal+' かいふくした！';
+    townMenu.messageTimer = 120;
+  } else if (action === 'sleep') {
+    player.hp = player.maxHp;
+    player.mp = player.maxMp;
+    townMenu.message = 'HP・MPが　かんぜんかいふく！';
+    townMenu.messageTimer = 120;
+  } else if (action === 'leave') {
+    townMenu.active = false;
+    townMenu.town = null;
+    townMenu.cursor = 0;
+    townMenu.message = '';
+  }
+}
+
+// ショップUI描画
+function drawShopUI() {
+  const wx=8, wy=H-118, ww=W-16, wh=110;
+  ctx.fillStyle='#000'; ctx.fillRect(wx,wy,ww,wh);
+  ctx.strokeStyle='#FFD700'; ctx.lineWidth=2; ctx.strokeRect(wx,wy,ww,wh);
+
+  // タブ
+  const tabs=['⚔武器','🛡防具','💊アイテム'];
+  ctx.font='14px monospace';
+  tabs.forEach((t,i)=>{
+    const tx2=wx+10+i*100, isSel=shop.tab===i;
+    ctx.fillStyle=isSel?'#FFD700':'#888';
+    ctx.fillText(t, tx2, wy+16);
+    if (isSel) { ctx.fillStyle='#FFD700'; ctx.fillRect(tx2,wy+18,ctx.measureText(t).width,2); }
+  });
+  // コイン
+  ctx.fillStyle='#FFEE44'; ctx.font='14px monospace'; ctx.textAlign='right';
+  ctx.fillText('G: '+player.coins, wx+ww-12, wy+16); ctx.textAlign='left';
+
+  if (shop.messageTimer>0) {
+    ctx.fillStyle='#AAFFAA'; ctx.font='16px monospace';
+    ctx.fillText(shop.message, wx+12, wy+62);
+    return;
+  }
+
+  const list=getShopList();
+  const view=3, start=Math.max(0,Math.min(shop.cursor-1,list.length-view));
+  for (let vi=0;vi<Math.min(view,list.length);vi++) {
+    const idx=start+vi, item=list[idx];
+    const isSel=shop.cursor===idx;
+    const rowY=wy+22+vi*26;
+    if (isSel) { ctx.fillStyle='#223366'; ctx.fillRect(wx+2,rowY,ww-4,24); }
+    ctx.fillStyle=isSel?'#FFD700':'#FFF'; ctx.font='15px monospace';
+    ctx.fillText((isSel?'▶ ':'  ')+item.name, wx+8, rowY+17);
+    ctx.fillStyle='#FFEE44'; ctx.font='14px monospace'; ctx.textAlign='right';
+    ctx.fillText(item.price+'G  '+item.desc, wx+ww-10, rowY+17); ctx.textAlign='left';
+  }
+  ctx.fillStyle='#666'; ctx.font='13px monospace';
+  ctx.fillText('←→タブ  ↑↓選択  Enter購入  X閉じる', wx+10, wy+104);
+}
+
+// フィールドメニューUI描画
+function drawFieldMenuUI() {
+  const wx=8, wy=H-118, ww=W-16, wh=110;
+  ctx.fillStyle='#111'; ctx.fillRect(wx,wy,ww,wh);
+  ctx.strokeStyle='#88AAFF'; ctx.lineWidth=2; ctx.strokeRect(wx,wy,ww,wh);
+
+  const tabs=['⚔装備','💊アイテム'];
+  ctx.font='14px monospace';
+  tabs.forEach((t,i)=>{
+    const tx2=wx+10+i*120, isSel=fieldMenu.tab===i;
+    ctx.fillStyle=isSel?'#88CCFF':'#666';
+    ctx.fillText(t, tx2, wy+16);
+  });
+  // 現在装備
+  ctx.fillStyle='#888'; ctx.font='13px monospace'; ctx.textAlign='right';
+  const wname=player.equip.weapon||'なし', aname=player.equip.armor||'なし';
+  ctx.fillText('武:'+wname+'  防:'+aname+'  ATK:'+playerAtk()+'  DEF:'+playerDef(), wx+ww-10, wy+16);
+  ctx.textAlign='left';
+
+  if (fieldMenu.messageTimer>0) {
+    ctx.fillStyle='#AAFFAA'; ctx.font='16px monospace';
+    ctx.fillText(fieldMenu.message, wx+12, wy+65); return;
+  }
+
+  if (fieldMenu.tab===0) {
+    const list=buildEquipList();
+    const view=3, start=Math.max(0,Math.min(fieldMenu.cursor-1,list.length-view));
+    for (let vi=0;vi<Math.min(view,list.length);vi++) {
+      const idx=start+vi, e=list[idx];
+      const isSel=fieldMenu.cursor===idx;
+      const rowY=wy+22+vi*26;
+      if (isSel) { ctx.fillStyle='#223366'; ctx.fillRect(wx+2,rowY,ww-4,24); }
+      ctx.fillStyle=isSel?'#FFD700':(e.equipped?'#88FF88':'#FFF'); ctx.font='15px monospace';
+      const mark=e.equipped?'[E] ':'    ';
+      ctx.fillText((isSel?'▶ ':'  ')+mark+e.name, wx+8, rowY+17);
+      ctx.fillStyle='#AAAAAA'; ctx.font='14px monospace'; ctx.textAlign='right';
+      ctx.fillText(e.desc||'', wx+ww-10, rowY+17); ctx.textAlign='left';
+    }
+  } else {
+    const inv=player.inventory;
+    if (inv.length===0) {
+      ctx.fillStyle='#888'; ctx.font='15px monospace'; ctx.fillText('アイテムがない', wx+12, wy+60);
+    } else {
+      const view=3, start=Math.max(0,Math.min(fieldMenu.cursor-1,inv.length-view));
+      for (let vi=0;vi<Math.min(view,inv.length);vi++) {
+        const idx=start+vi, slot=inv[idx];
+        const m=ITEM_MASTER[slot.itemId];
+        const isSel=fieldMenu.cursor===idx;
+        const rowY=wy+22+vi*26;
+        if (isSel) { ctx.fillStyle='#223366'; ctx.fillRect(wx+2,rowY,ww-4,24); }
+        ctx.fillStyle=isSel?'#FFD700':'#FFF'; ctx.font='15px monospace';
+        ctx.fillText((isSel?'▶ ':'  ')+m.name+' x'+slot.qty, wx+8, rowY+17);
+        ctx.fillStyle='#AAAAAA'; ctx.font='14px monospace'; ctx.textAlign='right';
+        ctx.fillText(m.desc, wx+ww-10, rowY+17); ctx.textAlign='left';
+      }
+    }
+  }
+  ctx.fillStyle='#666'; ctx.font='13px monospace';
+  ctx.fillText('←→タブ  ↑↓選択  Enter決定  M/X閉じる', wx+10, wy+104);
+}
+
+// 施設メニュー描画
+function drawTownMenu(town) {
+  const opts = getTownOptions(town);
+  const icon = town.type === 'village' ? '🏘' : '🏨';
+
+  // 背景ウィンドウ
+  const wx = 8, wy = H - 118, ww = W - 16, wh = 110;
+  ctx.fillStyle = '#000'; ctx.fillRect(wx, wy, ww, wh);
+  ctx.strokeStyle = town.type === 'village' ? '#FFCC44' : '#44AAFF';
+  ctx.lineWidth = 2; ctx.strokeRect(wx, wy, ww, wh);
+
+  // ヘッダー
+  ctx.fillStyle = town.type === 'village' ? '#FFCC44' : '#88CCFF';
+  ctx.font = 'bold 16px monospace';
+  const typeLabel = town.type === 'village' ? '【村】' : '【宿屋】';
+  ctx.fillText(typeLabel + ' ' + town.name, wx + 12, wy + 22);
+
+  if (townMenu.messageTimer > 0) {
+    ctx.fillStyle = '#AAFFAA'; ctx.font = '16px monospace';
+    ctx.fillText(townMenu.message, wx + 12, wy + 58);
+    ctx.fillStyle = '#888'; ctx.font = '14px monospace';
+    ctx.fillText('しばらくお待ちください...', wx + 12, wy + 82);
+  } else {
+    for (let i = 0; i < opts.length; i++) {
+      const isSel = townMenu.cursor === i;
+      if (isSel) {
+        ctx.fillStyle = '#223366';
+        ctx.fillRect(wx + 4, wy + 28 + i * 26, ww - 8, 24);
+      }
+      ctx.fillStyle = isSel ? '#FFD700' : '#FFFFFF';
+      ctx.font = '15px monospace';
+      ctx.fillText((isSel ? '▶ ' : '  ') + opts[i].label, wx + 12, wy + 45 + i * 26);
+    }
+  }
+}
+
+// 施設の「近くにいる」プロンプト描画
+function drawTownPrompt(town) {
+  const label = town.type === 'village'
+    ? '【村】' + town.name + '  Enter:メニュー  M:装備/アイテム'
+    : '【宿屋】' + town.name + '  Enter:メニュー  M:装備/アイテム';
+  const pw = ctx.measureText(label).width + 16;
+  const ph = 22, px2 = W/2 - pw/2, py2 = H - 130;
+  ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(px2, py2, pw, ph);
+  ctx.strokeStyle = town.type === 'village' ? '#FFCC44' : '#44AAFF';
+  ctx.lineWidth = 1; ctx.strokeRect(px2, py2, pw, ph);
+  ctx.fillStyle = town.type === 'village' ? '#FFEE88' : '#AADDFF';
+  ctx.font = '11px monospace';
+  ctx.fillText(label, px2 + 8, py2 + 13);
+}
+function drawMessageWindow(lines) {
+  const wx=8, wy=H-118, ww=W-16, wh=110;
+  ctx.fillStyle='#000'; ctx.fillRect(wx,wy,ww,wh);
+  ctx.strokeStyle='#FFF'; ctx.lineWidth=2; ctx.strokeRect(wx,wy,ww,wh);
+  ctx.fillStyle='#FFF'; ctx.font='16px monospace';
+  lines.forEach((l,i)=>ctx.fillText(l,wx+14,wy+28+i*28));
+}
+
+// 戦闘UI（メッセージ左＋コマンド右・2段階メニュー対応）
+function drawBattleUI(msg, active) {
+  const bottomY=H-118, msgW=W-180, cmdX=W-172;
+  const cmdW=160;
+
+  // ===== メッセージペイン（左） =====
+  ctx.fillStyle='#000'; ctx.fillRect(8,bottomY,msgW-8,110);
+  ctx.strokeStyle='#FFF'; ctx.lineWidth=2; ctx.strokeRect(8,bottomY,msgW-8,110);
+  if (msg) {
+    ctx.fillStyle='#FFF'; ctx.font='16px monospace';
+    const chars=msg.split('');
+    let line='',li=0;
+    for (const ch of chars) {
+      const test=line+ch;
+      if (ctx.measureText(test).width>msgW-40&&line!=='') {
+        ctx.fillText(line,20,bottomY+28+li*28); line=ch; li++;
+        if(li>=3) break;
+      } else line=test;
+    }
+    if(line&&li<3) ctx.fillText(line,20,bottomY+28+li*28);
+  }
+
+  // ===== コマンドペイン（右） =====
+  ctx.fillStyle='#000'; ctx.fillRect(cmdX,bottomY,cmdW,110);
+  ctx.strokeStyle='#FFF'; ctx.lineWidth=2; ctx.strokeRect(cmdX,bottomY,cmdW,110);
+
+  if (!active) {
+    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(cmdX,bottomY,cmdW,110);
+    return;
+  }
+
+  if (battle.menuLevel===0) {
+    ctx.fillStyle='#AAAAAA'; ctx.font='13px monospace';
+    ctx.fillText('なにをする？',cmdX+8,bottomY+16);
+
+    const cats=[
+      {label:'こうげき', color:'#FFFFFF'},
+      {label:'じゅもん', color:'#AADDFF'},
+    ];
+    cats.forEach((cat,i)=>{
+      const isSel=battle.categoryCursor===i;
+      if (isSel) {
+        ctx.fillStyle='#223366';
+        ctx.fillRect(cmdX+4,bottomY+22+i*40,cmdW-8,32);
+        ctx.strokeStyle='#6699FF'; ctx.lineWidth=1;
+        ctx.strokeRect(cmdX+4,bottomY+22+i*40,cmdW-8,32);
+      }
+      ctx.fillStyle=isSel?'#FFD700':cat.color;
+      ctx.font='17px monospace';
+      ctx.fillText((isSel?'▶ ':'  ')+cat.label,cmdX+8,bottomY+43+i*40);
+    });
+
+  } else {
+    const list=battle.categoryCursor===0?getLearnedAttackCmds():getLearnedMagicCmds();
+    const catName=battle.categoryCursor===0?'こうげき':'じゅもん';
+    ctx.fillStyle='#AAAAAA'; ctx.font='12px monospace';
+    ctx.fillText('← '+catName+'  (Xで戻る)',cmdX+6,bottomY+14);
+
+    const view=3;
+    const start=Math.max(0,Math.min(battle.subCursor-1,list.length-view));
+    for (let vi=0;vi<Math.min(view,list.length);vi++) {
+      const idx=start+vi;
+      if (idx>=list.length) break;
+      const cmd=list[idx];
+      const isSel=battle.subCursor===idx;
+      const canUse=cmd.mpCost===0||player.mp>=cmd.mpCost;
+      const rowY=bottomY+18+vi*28;
+
+      if (isSel) {
+        ctx.fillStyle='#223366';
+        ctx.fillRect(cmdX+4,rowY,cmdW-8,24);
+        ctx.strokeStyle='#6699FF'; ctx.lineWidth=1;
+        ctx.strokeRect(cmdX+4,rowY,cmdW-8,24);
+      }
+
+      ctx.fillStyle=!canUse?'#555555':(isSel?'#FFD700':cmd.color);
+      ctx.font='15px monospace';
+      ctx.fillText((isSel?'▶':'  ')+cmd.key,cmdX+6,rowY+17);
+
+      if (cmd.mpCost>0) {
+        ctx.fillStyle=canUse?'#44AAFF':'#884444';
+        ctx.font='11px monospace';
+        ctx.fillText('MP'+cmd.mpCost,cmdX+cmdW-38,rowY+17);
+      }
+    }
+
+    // スクロールインジケーター
+    if (list.length>view) {
+      ctx.fillStyle='#888'; ctx.font='16px monospace';
+      if (start>0) ctx.fillText('▲',cmdX+cmdW-14,bottomY+22);
+      if (start+view<list.length) ctx.fillText('▼',cmdX+cmdW-18,bottomY+98);
+    }
+
+    const selCmd=list[battle.subCursor];
+    if (selCmd) {
+      // たいあたりの場合は反動ダメージ予測値を追記
+      let desc = selCmd.desc;
+      let descColor = '#888888';
+      if (selCmd.id === 'taiatari') {
+        const recoil = Math.floor(player.maxHp * 0.08);
+        desc += '  ⚠反動:' + recoil + 'HP';
+        // 現在HPが反動ダメージ以下なら赤で警告
+        if (player.hp <= recoil) {
+          descColor = '#FF4444';
+          desc = '⚠ HP僅か！反動で倒れます (' + recoil + 'HP)';
+        }
+      }
+      ctx.fillStyle = descColor;
+      ctx.font = '12px monospace';
+      ctx.fillText(desc, cmdX+6, bottomY+104);
+    }
+  }
+}
+
+// y はバー上端のY座標。ラベルはバーの1px上、数値はバー内中央に描画する
+function drawStatBar(x,y,label,cur,max,cH,cM,cL) {
+  const barH = 13; // バーの高さ
+  const barMidY = y + barH / 2; // バー縦中央
+
+  // ラベル（バー左上にそろえる）
+  ctx.textBaseline = 'bottom';
+  ctx.fillStyle = '#FFF';
+  ctx.font = '12px monospace';
+  ctx.fillText(label, x, y - 1);
+
+  // バー背景
+  ctx.fillStyle = '#333';
+  ctx.fillRect(x, y, 110, barH);
+
+  // バー本体
+  const r = Math.max(0, cur / max);
+ 
+  ctx.fillStyle = r > 0.5 ? cH : r > 0.25 ? cM : cL;
+  ctx.fillRect(x, y, 110 * r, barH);
+
+  // バー枠
+  ctx.strokeStyle = '#FFF';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, 110, barH);
+
+  // 数値（バー右隣・縦中央）
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#FFF';
+  ctx.font = '12px monospace';
+  ctx.fillText(cur + '/' + max, x + 114, barMidY);
+
+  // textBaseline をデフォルトに戻す
+  ctx.textBaseline = 'alphabetic';
+}
+function drawHPBar(x,y,label,cur,max){drawStatBar(x,y,label,cur,max,'#33FF33','#FFAA00','#FF3333');}
+function drawMPBar(x,y,label,cur,max){drawStatBar(x,y,label,cur,max,'#44AAFF','#2266CC','#113366');}
+
+function drawTypingGauge(elapsed,limit) {
+  const gx=8,gy=H-136,gw=W-188,gh=14;
+  ctx.fillStyle='#111'; ctx.fillRect(gx,gy,gw,gh);
+  const r=Math.max(0,1-elapsed/limit);
+  ctx.fillStyle=r>0.5?'#00CCFF':r>0.25?'#FFCC00':'#FF4400';
+  ctx.fillRect(gx,gy,gw*r,gh);
+  ctx.strokeStyle='#FFF'; ctx.lineWidth=1; ctx.strokeRect(gx,gy,gw,gh);
+  ctx.fillStyle='#FFF'; ctx.font='11px monospace'; ctx.fillText('TIME',gx+3,gy+10);
+  const sec=Math.ceil((limit-elapsed)/1000);
+  ctx.fillStyle=r<0.25?'#FF4400':'#FFF'; ctx.font='16px monospace';
+  ctx.textAlign='right'; ctx.fillText(sec+'s',gx+gw-3,gy+10); ctx.textAlign='left';
+}
+
+function drawTypingTextInBattle(word,roman,typedCount) {
+  const wx=8, wy=H-118;
+  ctx.fillStyle='#FFD700'; ctx.font='16px monospace'; ctx.fillText('▶ '+word,wx+10,wy+24);
+
+  // ダークネス効果中：未入力文字のうちランダムな2文字を '*' で隠す
+  // 隠す位置は typingStart を種にして固定（タイプ中に変化しないよう）
+  let displayRoman = roman;
+  if (battle.darknessDebuff) {
+    const arr = roman.split('');
+    // typingStartを種にした擬似乱数で隠す位置を決定（毎フレーム変わらない）
+    const seed  = Math.floor(battle.typingStart) % 97;
+    const len   = arr.length;
+    const hide1 = typedCount + ((seed    ) % Math.max(1, len - typedCount));
+    const hide2 = typedCount + ((seed + 3) % Math.max(1, len - typedCount));
+    if (hide1 < len && hide1 >= typedCount) arr[hide1] = '*';
+    if (hide2 < len && hide2 >= typedCount && hide2 !== hide1) arr[hide2] = '*';
+    displayRoman = arr.join('');
+  }
+
+  ctx.font='24px monospace';
+  const startX=wx+10; let curX=startX;
+  for (let i=0;i<displayRoman.length;i++) {
+    const isDark = battle.darknessDebuff && displayRoman[i] === '*';
+    ctx.fillStyle = i<typedCount ? '#44FF44' : isDark ? '#FF4488' : '#CCCCCC';
+    ctx.fillText(displayRoman[i],curX,wy+76);
+    curX+=ctx.measureText(displayRoman[i]).width+1;
+  }
+  if (typedCount<roman.length) {
+    const doneW=ctx.measureText(roman.substring(0,typedCount)).width+typedCount;
+    if (Math.floor(Date.now()/300)%2===0) {
+      ctx.fillStyle='#FFF'; ctx.fillRect(startX+doneW,wy+54,2,24);
+    }
+  }
+
+  // ダークネス警告表示
+  if (battle.darknessDebuff) {
+    ctx.fillStyle='rgba(80,0,120,0.45)';
+    ctx.fillRect(wx, wy+48, 200, 34);
+    ctx.fillStyle='#FF88FF'; ctx.font='11px monospace';
+    ctx.fillText('🌑 ダークネス: * は隠された文字', wx+4, wy+70);
+  }
+}
+
+// 戦闘背景（バイオーム連動）
+function drawBattleBackground() {
+  const now  = Date.now();
+  const biome = battle.biome;
+  const isBoss = battle.isBossBattle;
+  const clipH = H * 0.58; // 背景描画の下端
+
+  // ===== バイオームごとの空色と大地色を定義 =====
+  // sky: [上端, 下端],  ground: [上端, 下端]
+  const themes = {
+    [BIOME.PLAIN]:   { sky:['#5BB8F5','#A8D8EA'], ground:['#5AB86C','#2E6B35'], skyExtra:'sun'  },
+    [BIOME.FOREST]:  { sky:['#1E3A1E','#2E5A28'], ground:['#1E4A20','#0E2A10'], skyExtra:'rays' },
+    [BIOME.DESERT]:  { sky:['#FF8C00','#FFD060'], ground:['#D4A84B','#9A7030'], skyExtra:'sun'  },
+    [BIOME.SNOW]:    { sky:['#B0BEC5','#E0EAF0'], ground:['#DDE8F0','#A8C0D0'], skyExtra:'snow' },
+    [BIOME.VOLCANO]: { sky:['#1A0A00','#3A1000'], ground:['#5A1000','#2A0800'], skyExtra:'lava' },
+    [BIOME.SWAMP]:   { sky:['#1E1A2E','#2E2240'], ground:['#1E2A18','#0E1A08'], skyExtra:'fog'  },
+    [BIOME.COAST]:   { sky:['#1E90FF','#6EC6FF'], ground:['#D4B96A','#4090C0'], skyExtra:'sea'  },
+  };
+  const theme = isBoss
+    ? { sky:['#08000E','#180028'], ground:['#200030','#0A0018'], skyExtra:'boss' }
+    : (themes[biome] || themes[BIOME.PLAIN]);
+
+  // ── 空グラデーション ──
+  const sg = ctx.createLinearGradient(0, 0, 0, clipH * 0.6);
+  sg.addColorStop(0, theme.sky[0]);
+  sg.addColorStop(1, theme.sky[1]);
+  ctx.fillStyle = sg;
+  ctx.fillRect(0, 0, W, clipH * 0.6);
+
+  // ── 空の追加演出 ──
+  switch (theme.skyExtra) {
+    case 'sun': {
+      // 太陽（砂漠はオレンジ大、平原は白黄小）
+      const sunCol = biome === BIOME.DESERT ? '#FFD020' : '#FFFFA0';
+      const sunR   = biome === BIOME.DESERT ? 38 : 24;
+      const sunX   = W * 0.82, sunY = H * 0.1;
+      // グロー
+      ctx.fillStyle = biome === BIOME.DESERT ? 'rgba(255,160,0,0.18)' : 'rgba(255,255,180,0.15)';
+      ctx.beginPath(); ctx.arc(sunX, sunY, sunR * 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = sunCol;
+      ctx.beginPath(); ctx.arc(sunX, sunY, sunR, 0, Math.PI * 2); ctx.fill();
+      // 太陽光線（砂漠のみ）
+      if (biome === BIOME.DESERT) {
+        ctx.strokeStyle = 'rgba(255,220,50,0.25)'; ctx.lineWidth = 2;
+        for (let i = 0; i < 8; i++) {
+          const a = (i / 8) * Math.PI * 2 + now * 0.0003;
+          ctx.beginPath();
+          ctx.moveTo(sunX + Math.cos(a) * (sunR + 4), sunY + Math.sin(a) * (sunR + 4));
+          ctx.lineTo(sunX + Math.cos(a) * (sunR + 18), sunY + Math.sin(a) * (sunR + 18));
+          ctx.stroke();
+        }
+      }
+      break;
+    }
+    case 'rays': {
+      // 木漏れ日（斜め光の束）
+      ctx.fillStyle = 'rgba(150,230,100,0.06)';
+      for (let i = 0; i < 5; i++) {
+        const rx = W * 0.1 + i * W * 0.18 + Math.sin(now * 0.0005 + i) * 10;
+        ctx.beginPath();
+        ctx.moveTo(rx, 0); ctx.lineTo(rx + 30, clipH * 0.6);
+        ctx.lineTo(rx + 60, clipH * 0.6); ctx.lineTo(rx + 30, 0);
+        ctx.closePath(); ctx.fill();
+      }
+      break;
+    }
+    case 'snow': {
+      // 雪粒（ゆっくり降る）
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      for (let i = 0; i < 30; i++) {
+        const sx = ((i * 73 + now * 0.02) % W);
+        const sy = ((i * 47 + now * 0.015) % (clipH * 0.6));
+        ctx.beginPath(); ctx.arc(sx, sy, 1.5, 0, Math.PI * 2); ctx.fill();
+      }
+      // 雪雲
+      ctx.fillStyle = 'rgba(200,210,220,0.35)';
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath(); ctx.ellipse(W * 0.2 + i * W * 0.3, H * 0.08, 60 + i * 20, 20, 0, 0, Math.PI * 2); ctx.fill();
+      }
+      break;
+    }
+    case 'lava': {
+      // 黒煙（上昇する煙粒子）
+      for (let i = 0; i < 15; i++) {
+        const phase = (now * 0.0008 + i * 0.42) % 1;
+        const sx  = W * 0.05 + (i * 43) % (W * 0.9);
+        const sy  = clipH * 0.6 * (1 - phase);
+        const sa  = 0.15 * (1 - phase);
+        ctx.fillStyle = `rgba(20,10,0,${sa})`;
+        ctx.beginPath(); ctx.arc(sx, sy, 8 + phase * 20, 0, Math.PI * 2); ctx.fill();
+      }
+      // 空中の赤オーラ（揺らぎ）
+      const laA = 0.08 + Math.sin(now * 0.002) * 0.03;
+      ctx.fillStyle = `rgba(200,40,0,${laA})`;
+      ctx.fillRect(0, 0, W, clipH * 0.6);
+      break;
+    }
+    case 'fog': {
+      // 霧（水平方向に流れる）
+      for (let i = 0; i < 4; i++) {
+        const fx = ((now * 0.02 * (i % 2 === 0 ? 1 : -1) + i * 150) % (W + 100)) - 50;
+        ctx.fillStyle = `rgba(80,40,120,${0.08 + i * 0.03})`;
+        ctx.beginPath(); ctx.ellipse(fx + W * 0.3, clipH * 0.35 + i * 20, 120, 30, 0, 0, Math.PI * 2); ctx.fill();
+      }
+      break;
+    }
+    case 'sea': {
+      // 水平線と波
+      ctx.fillStyle = '#2060AA';
+      ctx.fillRect(0, clipH * 0.42, W, clipH * 0.18);
+      // 光の反射
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      for (let i = 0; i < 6; i++) {
+        const wx = (now * 0.04 + i * 110) % W;
+        ctx.fillRect(wx, clipH * 0.44, 40, 2);
+      }
+      break;
+    }
+    case 'boss': {
+      // 禍々しい闇オーラ（ボス専用）
+      const ba = 0.12 + Math.sin(now * 0.003) * 0.06;
+      const bg2 = ctx.createRadialGradient(W / 2, H * 0.25, 20, W / 2, H * 0.25, 200);
+      bg2.addColorStop(0, `rgba(120,0,80,${ba})`);
+      bg2.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = bg2; ctx.fillRect(0, 0, W, clipH * 0.6);
+      // 赤い稲妻（確率で閃光）
+      if (Math.floor(now / 600) % 7 === 0) {
+        ctx.strokeStyle = 'rgba(255,60,120,0.5)'; ctx.lineWidth = 1.5;
+        let lx = W * 0.3 + Math.random() * W * 0.4, ly = 0;
+        ctx.beginPath(); ctx.moveTo(lx, ly);
+        for (let i = 0; i < 5; i++) {
+          lx += (Math.random() - 0.5) * 30; ly += clipH * 0.1;
+          ctx.lineTo(lx, ly);
+        }
+        ctx.stroke();
+      }
+      // 星（禍々しい色の星）
+      ctx.fillStyle = 'rgba(200,100,255,0.5)';
+      for (let i = 0; i < 20; i++) {
+        const sx = (i * 73) % W;
+        const sy = (i * 47) % (clipH * 0.5);
+        const sa = 0.3 + Math.sin(now * 0.004 + i) * 0.3;
+        ctx.globalAlpha = sa;
+        ctx.beginPath(); ctx.arc(sx, sy, 1, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      break;
+    }
+  }
+
+  // ── 地形シルエット（山稜線）──
+  const silCol = isBoss ? '#0A0012' : _darkenHex(theme.ground[0], 0.35);
+  ctx.fillStyle = silCol;
+  ctx.beginPath();
+  ctx.moveTo(0, clipH * 0.6);
+  // バイオームごとに山の形状を変える
+  const peaks = {
+    [BIOME.PLAIN]:   [[0,0.46],[0.09,0.38],[0.19,0.50],[0.30,0.34],[0.41,0.46],[0.53,0.30],[0.63,0.43],[0.75,0.36],[1,0.60]],
+    [BIOME.FOREST]:  [[0,0.40],[0.07,0.28],[0.15,0.40],[0.25,0.24],[0.38,0.38],[0.50,0.20],[0.62,0.34],[0.78,0.22],[1,0.50]],
+    [BIOME.DESERT]:  [[0,0.52],[0.15,0.48],[0.28,0.52],[0.42,0.46],[0.58,0.52],[0.72,0.47],[0.86,0.53],[1,0.55]],
+    [BIOME.SNOW]:    [[0,0.44],[0.08,0.28],[0.18,0.44],[0.28,0.24],[0.40,0.38],[0.54,0.22],[0.66,0.38],[0.80,0.26],[1,0.50]],
+    [BIOME.VOLCANO]: [[0,0.40],[0.10,0.50],[0.22,0.28],[0.30,0.50],[0.44,0.22],[0.54,0.44],[0.66,0.26],[0.80,0.48],[1,0.50]],
+    [BIOME.SWAMP]:   [[0,0.50],[0.12,0.46],[0.24,0.52],[0.38,0.44],[0.52,0.50],[0.66,0.46],[0.80,0.52],[1,0.55]],
+    [BIOME.COAST]:   [[0,0.52],[0.20,0.48],[0.40,0.52],[0.60,0.48],[0.80,0.52],[1,0.55]],
+  };
+  const pts = isBoss
+    ? [[0,0.42],[0.08,0.36],[0.18,0.48],[0.28,0.32],[0.40,0.46],[0.52,0.28],[0.64,0.44],[0.80,0.30],[1,0.50]]
+    : (peaks[biome] || peaks[BIOME.PLAIN]);
+  for (const [px2, py2] of pts) ctx.lineTo(W * px2, clipH * py2);
+  ctx.lineTo(W, clipH * 0.6); ctx.closePath(); ctx.fill();
+
+  // ── 大地グラデーション ──
+  const gg = ctx.createLinearGradient(0, clipH * 0.55, 0, clipH);
+  gg.addColorStop(0, theme.ground[0]);
+  gg.addColorStop(1, theme.ground[1]);
+  ctx.fillStyle = gg;
+  ctx.fillRect(0, clipH * 0.55, W, clipH * 0.45);
+
+  // ── 火山バイオーム追加：溶岩池（地面に赤い筋）──
+  if (biome === BIOME.VOLCANO && !isBoss) {
+    ctx.fillStyle = 'rgba(255,80,0,0.22)';
+    for (let i = 0; i < 3; i++) {
+      const lx2 = W * 0.1 + i * W * 0.3 + Math.sin(now * 0.001 + i) * 8;
+      ctx.beginPath(); ctx.ellipse(lx2, clipH * 0.62 + i * 4, 40 + i * 15, 6, 0, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ── 海岸バイオーム追加：砂浜ライン ──
+  if (biome === BIOME.COAST) {
+    ctx.fillStyle = '#D4B96A';
+    ctx.fillRect(0, clipH * 0.55, W, 12);
+  }
+}
+
+function drawBattlePlayer() {
+  const now = Date.now();
+  // ===== キャラクタースケール（1.5倍・サイズアップ） =====
+  const SCALE = 1.5;
+
+  // ===== 待機アニメーション =====
+  // 呼吸：1.8秒周期で上下±4px、横±1%伸縮（1.5倍スケールに合わせ増幅）
+  const breath = Math.sin(now * 0.0035);
+  const bobY   = breath * 4;
+  const scaleX = 1 + breath * 0.018;
+  const scaleY = 1 - breath * 0.018;
+
+  // ===== シェイク（1.5倍スケールに合わせて振れ幅も増幅） =====
+  const shakeX = calcShake(battle.playerShake, 9);
+  if (battle.playerShake > 0) battle.playerShake--;
+
+  // ベース座標（スケールアップ分だけ少し左＆上に移動）
+  const cx = W / 4 + shakeX;
+  const cy = H * 0.55 - 32 * SCALE + bobY;
+
+  ctx.save();
+  // 足元を基準にスケール（呼吸アニメ）
+  ctx.translate(cx, cy + 40 * SCALE);
+  ctx.scale(scaleX * SCALE, scaleY * SCALE);
+  ctx.translate(-cx, -(cy + 40 * SCALE));
+
+  // ===== プレイヤー本体描画 =====
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.22)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 40, 12, 4, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 足（茶色ブーツ）
+  ctx.fillStyle = '#5C2A00';
+  ctx.fillRect(cx - 9, cy + 30, 7, 12);
+  ctx.fillRect(cx + 2,  cy + 30, 7, 12);
+  // ブーツの先
+  ctx.fillStyle = '#3A1800';
+  ctx.fillRect(cx - 10, cy + 38, 9, 4);
+  ctx.fillRect(cx + 1,  cy + 38, 9, 4);
+
+  // 胴体（青い鎧）
+  const armorGrad = ctx.createLinearGradient(cx - 10, cy + 14, cx + 10, cy + 14);
+  armorGrad.addColorStop(0,   '#1A55BB');
+  armorGrad.addColorStop(0.5, '#2E74DD');
+  armorGrad.addColorStop(1,   '#1A55BB');
+  ctx.fillStyle = armorGrad;
+  ctx.fillRect(cx - 9, cy + 14, 18, 16);
+
+  // 肩アーマー（赤・立体感）
+  ctx.fillStyle = '#DD3300';
+  ctx.beginPath();
+  ctx.ellipse(cx - 11, cy + 17, 6, 4, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx + 11, cy + 17, 6, 4, 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  // 肩ハイライト
+  ctx.fillStyle = '#FF5522';
+  ctx.beginPath();
+  ctx.ellipse(cx - 11, cy + 16, 4, 2.5, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx + 11, cy + 16, 4, 2.5, 0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 腕（袖・青）
+  ctx.fillStyle = '#2266CC';
+  ctx.fillRect(cx - 15, cy + 15, 6, 12);
+  ctx.fillRect(cx + 9,  cy + 15, 6, 12);
+  // 手（肌色）
+  ctx.fillStyle = '#F4C07A';
+  ctx.fillRect(cx - 14, cy + 26, 5, 5);
+  ctx.fillRect(cx + 9,  cy + 26, 5, 5);
+
+  // 鎧の中央ライン
+  ctx.fillStyle = '#FFD700';
+  ctx.fillRect(cx - 1, cy + 14, 2, 16);
+
+  // 首
+  ctx.fillStyle = '#F4C07A';
+  ctx.fillRect(cx - 3, cy + 9, 6, 6);
+
+  // 頭（顔）
+  const faceGrad = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy + 2, 9);
+  faceGrad.addColorStop(0,   '#FFD49A');
+  faceGrad.addColorStop(1,   '#E8A860');
+  ctx.fillStyle = faceGrad;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 3, 9, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 目
+  ctx.fillStyle = '#1A1A1A';
+  ctx.beginPath(); ctx.arc(cx - 3, cy + 2, 2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 3, cy + 2, 2, 0, Math.PI * 2); ctx.fill();
+  // 目のハイライト
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath(); ctx.arc(cx - 2.5, cy + 1.5, 0.8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + 3.5, cy + 1.5, 0.8, 0, Math.PI * 2); ctx.fill();
+
+  // 眉（凛々しい）
+  ctx.fillStyle = '#5C3010';
+  ctx.fillRect(cx - 5, cy - 2, 4, 1.5);
+  ctx.fillRect(cx + 1, cy - 2, 4, 1.5);
+
+  // 鼻
+  ctx.fillStyle = '#C8905A';
+  ctx.fillRect(cx - 1, cy + 5, 2, 2);
+
+  // 口（軽い微笑み）
+  ctx.strokeStyle = '#8B4010';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.arc(cx, cy + 7, 3, 0.2, Math.PI - 0.2, false);
+  ctx.stroke();
+
+  // 髪（茶色・前髪）
+  ctx.fillStyle = '#3A2010';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - 6, 10, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // 前髪の垂れ（ひと房）
+  ctx.beginPath();
+  ctx.moveTo(cx - 8, cy - 2);
+  ctx.quadraticCurveTo(cx - 10, cy + 2, cx - 7, cy + 4);
+  ctx.lineWidth = 3; ctx.strokeStyle = '#3A2010';
+  ctx.stroke();
+
+  // ===== 被弾フラッシュ（赤半透明） =====
+  if (battle.playerHitFlash > 0) {
+    battle.playerHitFlash--;
+    ctx.fillStyle = `rgba(255,60,0,${battle.playerHitFlash / 8 * 0.5})`;
+    ctx.fillRect(cx - 16, cy - 8, 32, 50);
+  }
+
+  ctx.restore();
+}
+
+// ===== ゲームクリア画面 =====
+function drawGameClear(timer) {
+  // フェードイン（最初の120フレーム）
+  const alpha = Math.min(1, timer / 120);
+
+  // 背景（漆黒→深紫グラデーション）
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#000000');
+  bg.addColorStop(1, '#1A0030');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 星（ゆっくり輝く）
+  ctx.fillStyle = '#FFFFFF';
+  const stars = [
+    30,20, 80,50, 140,15, 200,40, 280,10, 340,35, 410,18,
+    470,45, 520,22, 580,38, 610,12, 60,70, 180,65, 360,72,
+    500,60, 550,80, 90,90, 250,85, 430,90,
+  ];
+  for (let i = 0; i < stars.length; i += 2) {
+    ctx.globalAlpha = alpha * (0.4 + Math.sin(timer * 0.03 + i) * 0.3);
+    ctx.fillRect(stars[i], stars[i+1], 1.5, 1.5);
+  }
+  ctx.globalAlpha = alpha;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // ===== タイトル「THE END」=====
+  if (timer > 60) {
+    const t2 = Math.min(1, (timer - 60) / 90);
+    ctx.globalAlpha = alpha * t2;
+    ctx.fillStyle = '#FFD700';
+    ctx.font = 'bold 48px monospace';
+    // 影
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillText('THE END', W/2+3, H*0.22+3);
+    const g = ctx.createLinearGradient(0, H*0.12, 0, H*0.32);
+    g.addColorStop(0, '#FFE866');
+    g.addColorStop(0.5, '#FFD700');
+    g.addColorStop(1, '#CC9900');
+    ctx.fillStyle = g;
+    ctx.fillText('THE END', W/2, H*0.22);
+  }
+
+  // ===== サブタイトル =====
+  if (timer > 120) {
+    const t3 = Math.min(1, (timer - 120) / 60);
+    ctx.globalAlpha = alpha * t3;
+    ctx.fillStyle = '#AACCFF';
+    ctx.font = '15px monospace';
+    ctx.fillText('タイピング魔王を打ち倒し 世界に平和が訪れた', W/2, H*0.32);
+  }
+
+  // ===== スタッフロール =====
+  const credits = [
+    { label: '--- GAME CLEAR ---',        color: '#FFD700', bold: true,  t: 180 },
+    { label: 'GAME DESIGN & PROGRAMMING', color: '#88CCFF', bold: false, t: 230 },
+    { label: 'You',                        color: '#FFFFFF', bold: true,  t: 270 },
+    { label: '',                           color: '',        bold: false, t: 310 },
+    { label: 'POWERED BY',                 color: '#88CCFF', bold: false, t: 330 },
+    { label: 'Web Audio API  Canvas 2D',   color: '#CCCCCC', bold: false, t: 370 },
+    { label: '',                           color: '',        bold: false, t: 400 },
+    { label: 'SPECIAL THANKS',             color: '#88CCFF', bold: false, t: 420 },
+    { label: 'All Typists',                color: '#FFFFFF', bold: true,  t: 460 },
+  ];
+  for (const c of credits) {
+    if (timer < c.t || !c.label) continue;
+    const ct = Math.min(1, (timer - c.t) / 40);
+    ctx.globalAlpha = alpha * ct;
+    ctx.fillStyle = c.color;
+    ctx.font = (c.bold ? 'bold ' : '') + '16px monospace';
+    // スクロールY（遅いスクロール）
+    const scrollY = Math.max(0, (timer - 300) * 0.3);
+    const baseY   = H * 0.44 + credits.indexOf(c) * 28 - scrollY;
+    if (baseY > 10 && baseY < H - 10) ctx.fillText(c.label, W/2, baseY);
+  }
+
+  // ===== 「Enter/Spaceでタイトルへ」（450フレーム以降、点滅） =====
+  if (timer > 450) {
+    const blinkOn = Math.floor(timer / 35) % 2 === 0;
+    ctx.globalAlpha = alpha * (blinkOn ? 0.9 : 0.3);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '14px monospace';
+    ctx.fillText('Enter / Space  でタイトルへ戻る', W/2, H - 24);
+  }
+
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawResultScreen(win) {
+  ctx.fillStyle='rgba(0,0,0,0.75)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  if (win) {
+    ctx.fillStyle='#FFD700'; ctx.font='bold 34px monospace'; ctx.fillText('しょうり！',W/2,H/2-80);
+    ctx.fillStyle='#FFFFFF'; ctx.font='17px monospace';
+    ctx.fillText(enemy.name+' (Lv'+enemy.lv+') をたおした！',W/2,H/2-52);
+    ctx.fillStyle='#AAFFAA'; ctx.font='16px monospace';
+    ctx.fillText('+ '+lastExpGain+' EXP    + '+lastCoinGain+' コイン', W/2, H/2-26);
+    const expNeeded=expToNext(player.lv);
+    const bw=260, bx=W/2-130;
+    ctx.fillStyle='#333'; ctx.fillRect(bx,H/2-8,bw,12);
+    ctx.fillStyle='#44CCFF'; ctx.fillRect(bx,H/2-8,bw*Math.min(1,player.exp/expNeeded),12);
+    ctx.strokeStyle='#88EEFF'; ctx.lineWidth=1; ctx.strokeRect(bx,H/2-8,bw,12);
+    ctx.fillStyle='#AAEEFF'; ctx.font='17px monospace';
+    ctx.fillText('EXP '+player.exp+'/'+expNeeded+'  (Lv'+player.lv+')',W/2,H/2+18);
+    if (lastLevelUp>0) {
+      ctx.fillStyle='#FFD700'; ctx.font='bold 22px monospace';
+      ctx.fillText('★ LEVEL UP! → Lv'+player.lv+' ★',W/2,H/2+44);
+      ctx.fillStyle='#CCFFCC'; ctx.font='16px monospace';
+      ctx.fillText('HP+'+lastStatGain.hp+'  MP+'+lastStatGain.mp+'  ATK+'+lastStatGain.atk+'  DEF+'+lastStatGain.def,W/2,H/2+62);
+
+      // 技習得メッセージ（lastLearnedSkills に id が入っている場合）
+      if (lastLearnedSkills.length > 0) {
+        // id → 表示名を ATTACK_CMDS / MAGIC_CMDS から引く
+        const allCmds = [...ATTACK_CMDS, ...MAGIC_CMDS];
+        lastLearnedSkills.forEach((id, i) => {
+          const cmd = allCmds.find(c => c.id === id);
+          const label = cmd ? cmd.key : id;
+          ctx.fillStyle = '#FFD700';
+          ctx.font = 'bold 17px monospace';
+          ctx.fillText('✨ ' + label + ' を おぼえた！', W/2, H/2 + 86 + i * 24);
+        });
+      }
+    }
+    ctx.fillStyle='#AAAAAA'; ctx.font='17px monospace';
+    // 技習得がある場合は下にずらして重ならないようにする
+    const enterY = lastLevelUp > 0 && lastLearnedSkills.length > 0
+      ? H/2 + 90 + lastLearnedSkills.length * 24
+      : H-40;
+    ctx.fillText('Enterキーでフィールドへ', W/2, Math.max(H-40, enterY));
+  } else {
+    ctx.fillStyle='#FF4444'; ctx.font='bold 38px monospace'; ctx.fillText('ゲームオーバー',W/2,H/2-30);
+    ctx.fillStyle='#FFFFFF'; ctx.font='16px monospace'; ctx.fillText('到達レベル: '+player.lv,W/2,H/2+10);
+    // セーブデータの有無でメッセージを切り替え
+    if (hasSaveData()) {
+      ctx.fillStyle='#AAFFAA'; ctx.font='17px monospace';
+      ctx.fillText('Enterキーでセーブ地点から再開',W/2,H/2+40);
+      ctx.fillStyle='#888888'; ctx.font='13px monospace';
+      ctx.fillText('（セーブデータがない場合はタイトルへ）',W/2,H/2+62);
+    } else {
+      ctx.fillStyle='#AAAAAA'; ctx.font='17px monospace';
+      ctx.fillText('Enterキーでタイトルへ戻る',W/2,H/2+40);
+    }
+  }
+  ctx.textAlign='left';
+}
+
+// フィールド描画
+function renderField() {
+  // トップダウン：プレイヤーをピクセル座標に変換してカメラ中心に
+  field.camX = field.px * TW - W / 2 + TW / 2;
+  field.camY = field.py * TH - (H - 120) / 2 + TH / 2;
+  drawIsoField(field.camX,field.camY,field.walkFrame,field.facing);
+
+  const biome=getCurrentBiome();
+  const biomeInfo=BIOME_INFO[biome]||BIOME_INFO[0];
+  const expNeeded=expToNext(player.lv);
+
+  if (shop.active) {
+    drawShopUI();
+  } else if (fieldMenu.active) {
+    drawFieldMenuUI();
+  } else if (townMenu.active) {
+    // 施設メニュー表示中
+    drawTownMenu(townMenu.town);
+  } else {
+    // 通常フィールドUI
+    drawMessageWindow([
+      'Lv'+player.lv+'  HP '+player.hp+'/'+player.maxHp+'  MP '+player.mp+'/'+player.maxMp,
+      '['+biomeInfo.name+']  EXP '+player.exp+'/'+expNeeded+'  G:'+player.coins,
+    ]);
+    // EXPバー
+    const bx=20,by=H-25,bw=W-40,bh=8;
+    ctx.fillStyle='#222'; ctx.fillRect(bx,by,bw,bh);
+    ctx.fillStyle='#44AAFF'; ctx.fillRect(bx,by,bw*Math.min(1,player.exp/expNeeded),bh);
+    ctx.strokeStyle='#446688'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,bh);
+
+    // 近くに施設があればプロンプト表示
+    const nearTown = getNearbyTown();
+    if (nearTown) drawTownPrompt(nearTown);
+
+    // 安全圏内に入っているとき「[安全圏]」ラベルをUIに表示
+    if (nearTown) {
+      ctx.fillStyle = '#88FFAA';
+      ctx.font = 'bold 12px monospace';
+      ctx.textBaseline = 'bottom';
+      ctx.textAlign = 'right';
+      ctx.fillText('[安全圏]', W - 180, H - 10); // EXPバー右端の内側
+      ctx.textBaseline = 'alphabetic';
+      ctx.textAlign = 'left';
+    }
+
+    // ボスに接近中はプロンプト表示（撃破済みは非表示）
+    if (BOSS_EVENT.isNear && !BOSS_EVENT.isDefeated) {
+      drawMessageWindow([
+        'まがまがしい妖気を感じる…！',
+        '[Enter で決戦]',
+      ]);
+    }
+  }
+
+  // ミニマップ（右上・常時表示）
+  // フレーム幅 = 160 + 4*2 = 168px、右端から 4px 余白
+  drawMinimap(W - 172, 8);
+
+  // セーブ通知（画面中央上部にフェードイン/アウト表示）
+  if (saveNotify.timer > 0) {
+    saveNotify.timer--;
+    // フェードイン（最初の15フレーム）とフェードアウト（最後の30フレーム）
+    const fade = Math.min(1,
+      saveNotify.timer < 30
+        ? saveNotify.timer / 30          // フェードアウト
+        : (SAVE_NOTIFY_DURATION - saveNotify.timer) < 15
+          ? (SAVE_NOTIFY_DURATION - (SAVE_NOTIFY_DURATION - saveNotify.timer)) / 15  // フェードイン
+          : 1
+    );
+    const notifyW = 220, notifyH = 32;
+    const notifyX = (W - notifyW) / 2;
+    const notifyY = 54;
+
+    ctx.globalAlpha = fade * 0.82;
+    ctx.fillStyle = '#111';
+    ctx.fillRect(notifyX, notifyY, notifyW, notifyH);
+    ctx.strokeStyle = '#88CCFF';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(notifyX + 0.5, notifyY + 0.5, notifyW - 1, notifyH - 1);
+
+    ctx.globalAlpha = fade;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 15px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(saveNotify.msg, W / 2, notifyY + notifyH / 2);
+
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+}
+
+// 戦闘描画
+function renderBattle() {
+  drawBattleBackground();
+  drawBattlePlayer();
+  drawEnemy(enemy);
+  // HP/MPバー：ラベル(12px) + バー(13px) = 25px/行、行間4px で配置
+  // y はバー上端。ラベルはバーの1px上に描かれるため画面上端から余白8px確保
+  drawHPBar(8, 20, 'ゆうしゃ Lv'+player.lv, player.hp, player.maxHp);
+  drawMPBar(8, 50, 'MP', player.mp, player.maxMp);
+  // 敵の状態異常アイコン（残りターン数付き、早期解除の可能性も表示）
+  const enemyStatusIcon =
+      enemy.status === 'poison'    ? ' 🟣' + enemy.statusTurns
+    : enemy.status === 'paralysis' ? ' ⚡'  + enemy.statusTurns
+    : enemy.status === 'burn'      ? ' 🔥' + enemy.statusTurns
+    : enemy.status === 'freeze'    ? ' 🧊' + enemy.statusTurns
+    : enemy.status === 'shock'     ? ' ⚡' + enemy.statusTurns
+    : '';
+  drawHPBar(W-260, 20, enemy.name+' Lv'+enemy.lv+enemyStatusIcon, enemy.hp, enemy.maxHp);
+  // ATK/DEFはMPバー(y=50〜63)の下に8px空けて配置
+  ctx.fillStyle='#AAAAAA'; ctx.font='13px monospace';
+  ctx.textBaseline='top';
+  ctx.fillText('ATK:'+player.atk+' DEF:'+player.def, 8, 71);
+  ctx.textBaseline='alphabetic';
+  // バイキルト発動中の表示
+  if (battle.atkBuff>0) {
+    ctx.fillStyle='#FFFF44'; ctx.font='bold 12px monospace';
+    ctx.textBaseline='top';
+    ctx.fillText('⚡オーラ発動中！', 8, 86);
+    ctx.textBaseline='alphabetic';
+  }
+
+  if (battle.phase==='command') {
+    const msg=battle.messageTimer>0?battle.message:'なにをする？';
+    drawBattleUI(msg, battle.messageTimer<=0);
+  } else if (battle.phase==='typing') {
+    drawBattleUI(null, false);
+    const elapsed=performance.now()-battle.typingStart;
+    drawTypingGauge(elapsed,battle.typingLimit);
+    drawTypingTextInBattle(battle.typingWord,battle.typingTarget,battle.typingIndex);
+  } else if (battle.phase==='result_player'||battle.phase==='result_enemy') {
+    drawBattleUI(battle.message, false);
+  }
+
+  // エフェクト描画（常に最前面）
+  drawEffects();
+}
+// ===== ゲームループ =====
+let lastTime=0, walkAnimTimer=0;
+
+function gameLoop(ts) {
+  const dt=ts-lastTime; lastTime=ts;
+  ctx.clearRect(0,0,W,H);
+
+  // ===== タイトル画面 =====
+  if (mode==='title') {
+    bgmSyncToMode('title');
+    title.animTimer++;
+    drawTitle(title.animTimer);
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  // ===== あそびかた画面 =====
+  if (mode==='howtoplay') {
+    title.animTimer++;
+    drawHowToPlay(title.animTimer);
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  if (mode==='field') {
+    // ショップ・フィールドメニュー・施設メニューが開いているときは移動停止して描画だけ
+    if (shop.active || fieldMenu.active || townMenu.active) {
+      if (townMenu.active && townMenu.messageTimer > 0) {
+        townMenu.messageTimer--;
+        if (townMenu.messageTimer === 0) townMenu.message = '';
+      }
+      if (shop.messageTimer > 0) shop.messageTimer--;
+      if (fieldMenu.messageTimer > 0) fieldMenu.messageTimer--;
+      renderField();
+      requestAnimationFrame(gameLoop);
+      return;
+    }
+
+    const speed=0.06; let dx=0,dy=0;
+    if (keys['ArrowUp']   ||keys['w']) { dy-=speed; }
+    if (keys['ArrowDown'] ||keys['s']) { dy+=speed; }
+    if (keys['ArrowLeft'] ||keys['a']) { dx-=speed; }
+    if (keys['ArrowRight']||keys['d']) { dx+=speed; }
+    if (dx!==0&&dy!==0) { dx*=0.707; dy*=0.707; }
+    const moved=dx!==0||dy!==0;
+
+    if (moved) {
+      if      (dy<0&&Math.abs(dy)>=Math.abs(dx)) field.facing='up';
+      else if (dy>0&&Math.abs(dy)>=Math.abs(dx)) field.facing='down';
+      else if (dx<0) field.facing='left';
+      else           field.facing='right';
+      const nx=Math.max(0.5,Math.min(MAP_W-1.5,field.px+dx));
+      const ny=Math.max(0.5,Math.min(MAP_H-1.5,field.py+dy));
+      const tx=Math.round(nx), ty=Math.round(ny);
+      const tid=(tx>=0&&ty>=0&&tx<MAP_W&&ty<MAP_H)?mapTiles[ty][tx]:0;
+      if (tid!==70&&tid!==71) {
+        // 木・岩との衝突
+        let blocked=false;
+        for (const obj of mapObjects) {
+          if (Math.hypot(nx-obj.tx,ny-obj.ty)<0.7) { blocked=true; break; }
+        }
+        if (!blocked) { field.px=nx; field.py=ny; }
+      }
+
+      field.moving=true;
+      walkAnimTimer+=dt;
+      if (walkAnimTimer>180) {
+        walkAnimTimer=0;
+        field.walkFrame=1-field.walkFrame;
+        field.stepCount++;
+        // バイオームごとのエンカウント率補正
+        const biome=getCurrentBiome();
+        const encMod=BIOME_INFO[biome]?.encRate||1.0;
+        const threshold=Math.floor(field.encountSteps/encMod);
+        if (field.stepCount>=threshold) {
+          field.stepCount=0;
+          field.encountSteps=15+Math.floor(Math.random()*15);
+          // 施設の近くではエンカウントしない
+          // ボス近くでも雑魚エンカウントしない
+          if (!getNearbyTown() && !BOSS_EVENT.isNear) startFlash();
+        }
+      }
+    } else {
+      field.moving=false; field.walkFrame=0; walkAnimTimer=0;
+    }
+
+    // ===== ボス接近判定 =====
+    if (!BOSS_EVENT.isDefeated) {
+      const bossDist = Math.hypot(field.px - BOSS_EVENT.tx, field.py - BOSS_EVENT.ty);
+      BOSS_EVENT.isNear = bossDist < BOSS_EVENT.triggerRadius;
+    } else {
+      BOSS_EVENT.isNear = false;
+    }
+
+    renderField();
+
+    // ===== リトライフェードイン演出 =====
+    if (retryFade.active) {
+      retryFade.timer++;
+      // 暗転（alpha: 1→0）でじわっとフィールドを浮き上がらせる
+      const alpha = Math.max(0, 1 - retryFade.timer / retryFade.duration);
+      ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+      ctx.fillRect(0, 0, W, H);
+
+      // フェード完了
+      if (retryFade.timer >= retryFade.duration) {
+        retryFade.active = false;
+        bgmSyncToMode('field'); // 完全に明るくなってからBGM開始
+      }
+    }
+
+  } else if (mode==='flash') {
+    flash.timer++; flash.phase=Math.floor(flash.timer/5);
+    if (flash.timer<flash.duration) {
+      renderField();
+      if (flash.phase%2===0) {
+        // ボスフラッシュは赤黒、通常は白黒
+        const fc = flash.isBoss ? 'rgba(255,0,0,0.5)' : 'rgba(255,255,255,0.9)';
+        ctx.fillStyle=fc; ctx.fillRect(0,0,W,H);
+      }
+      ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(0,0,W,H);
+    } else {
+      if (flash.isBoss) { flash.isBoss=false; startBossBattle(); }
+      else              { startBattle(); }
+    }
+
+  } else if (mode==='battle') {
+    updateEffects(dt);
+    if (battle.phase==='typing') {
+      if (performance.now()-battle.typingStart>=battle.typingLimit) {
+        seTypingFail(); // 時間切れSE
+        battle.message='時間切れ！ダメージ0！';
+        setBattleMessage(battle.message,true);
+      }
+    }
+    if (battle.messageTimer>0) {
+      battle.messageTimer--;
+      if (battle.messageTimer===0) {
+        if (battle.phase==='result_player') {
+          if (enemy.hp<=0) {
+            const gain=Math.round(enemy.baseExp*(1+(enemy.lv-1)*0.2));
+            lastExpGain=gain; player.exp+=gain; lastLevelUp=tryLevelUp();
+            // コインドロップ（Lvスケール＋ランダム変動）
+            const baseCoin = enemy.coinDrop || 5;
+            const coin = Math.round(baseCoin * (1+(enemy.lv-1)*0.25) * (0.8+Math.random()*0.4));
+            lastCoinGain = coin;
+            player.coins += coin;
+            // ボス撃破 → ゲームクリア
+            if (enemy.isBoss) {
+              BOSS_EVENT.isDefeated = true;
+              gameclearTimer = 0;
+              mode = 'gameclear';
+              bgmSyncToMode('gameclear');
+            } else {
+              mode='victory'; bgmSyncToMode('victory');
+            }
+          } else if (battle.enemyPending) { enemyAttack(); }
+          else { battle.phase='command'; }
+        } else if (battle.phase==='result_enemy') {
+          if (player.hp<=0) { mode='gameover'; bgmSyncToMode('gameover'); }
+          else { battle.phase='command'; battle.message=''; }
+        } else if (battle.phase==='command') { battle.message=''; }
+      }
+    }
+    renderBattle();
+    if (mode==='victory') { renderBattle(); drawResultScreen(true); }
+    else if (mode==='gameover') { renderBattle(); drawResultScreen(false); }
+
+  } else if (mode==='victory') {
+    renderBattle(); drawEffects(); drawResultScreen(true);
+  } else if (mode==='gameover') {
+    renderBattle(); drawEffects(); drawResultScreen(false);
+  } else if (mode==='gameclear') {
+    gameclearTimer++;
+    drawGameClear(gameclearTimer);
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
